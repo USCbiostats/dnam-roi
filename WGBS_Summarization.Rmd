@@ -1,0 +1,345 @@
+---
+title: "WGBS_Summarization"
+output: html_document
+date: "2025-01-09"
+---
+
+```{r}
+# Load necessary libraries
+library(GenomicRanges)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(GenomeInfoDb)
+library(rtracklayer)
+```
+
+```{r,warning=FALSE,message=FALSE}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("JASPAR2024", update = FALSE)
+BiocManager::install("AnnotationHub", update = FALSE) 
+BiocManager::install("plyranges", update = FALSE)
+```
+
+
+```{r}
+#############################################################
+# 1) Define file paths and samples
+#############################################################
+data_dir <- "data"  # Directory containing the WGBS .bed files
+samples <- c("DA", "DB", "IA", "IB", "HA", "HB", "JA", "JB", "MA", "MB","JN","IN")
+
+# The blacklist file (gzipped BED)
+blacklist_file <- file.path(data_dir, "hg38-blacklist.v2.bed.gz")
+
+#############################################################
+# 2) Read the blacklist as a GRanges
+#############################################################
+blacklist_gr <- import(blacklist_file, format = "BED")
+seqlevelsStyle(blacklist_gr) <- "UCSC"  # Ensure consistent naming, if needed
+
+#############################################################
+# 3) Define a function to read and filter a WGBS bed file
+#############################################################
+read_and_filter_wgbs <- function(bed_file, blacklist_gr) {
+  # bed_file: path to the .bed file
+  # blacklist_gr: GRanges for the blacklist
+
+  # Read the .bed file
+  meth_data <- fread(bed_file, header = FALSE)
+  # Assume columns: chrom, start, end, beta, coverage, methylated, unmethylated
+  colnames(meth_data) <- c("chrom", "start", "end", "beta", "coverage", "methylated", "unmethylated")
+
+  # Create GRanges
+  meth_gr <- GRanges(
+    seqnames = meth_data$chrom,
+    ranges = IRanges(start = meth_data$start, end = meth_data$end),
+    beta = meth_data$beta,
+    coverage = meth_data$coverage,
+    methylated = meth_data$methylated,
+    unmethylated = meth_data$unmethylated
+  )
+  seqlevelsStyle(meth_gr) <- "UCSC"
+
+  # Subset to exclude blacklist overlaps
+  # 'invert=TRUE' keeps regions NOT overlapping with the blacklist
+  filtered_gr <- subsetByOverlaps(meth_gr, blacklist_gr, invert = TRUE)
+
+  return(filtered_gr)
+}
+
+#############################################################
+# 4) Summarize function
+#############################################################
+summarize_wgbs <- function(meth_gr, sample_name) {
+  # Convert to data.table for quick summarization
+  meth_dt <- as.data.table(mcols(meth_gr))
+  
+  # Coverage column might be named 'coverage'
+  # We define depth so we can reuse common variable names
+  meth_dt$depth <- meth_dt$coverage
+  
+  # Summarize
+  # n_CpG = total number of CpGs
+  # avg_beta = mean of 'beta'
+  # median_beta = median of 'beta'
+  # avg_depth = mean coverage
+  # median_depth = median coverage
+  # max_depth = maximum coverage
+  # frac_depth5 = fraction of coverage > 4
+  # We'll store them in a small 1-row data.table
+  if (nrow(meth_dt) == 0) {
+    # No data after filtering
+    summary_dt <- data.table(
+      sample = sample_name,
+      n_CpG = 0,
+      avg_beta = NA_real_,
+      median_beta = NA_real_,
+      avg_depth = NA_real_,
+      median_depth = NA_real_,
+      max_depth = NA_real_,
+      frac_depth5 = NA_real_
+    )
+  } else {
+    summary_dt <- meth_dt[, .(
+      sample = sample_name,
+      n_CpG = .N,
+      avg_beta = mean(beta, na.rm = TRUE),
+      median_beta = median(beta, na.rm = TRUE),
+      avg_depth = mean(depth, na.rm = TRUE),
+      median_depth = as.numeric(median(depth, na.rm = TRUE)),
+      max_depth = max(depth, na.rm = TRUE),
+      frac_depth5 = mean(depth > 4, na.rm = TRUE)
+    )]
+  }
+  
+  return(summary_dt)
+}
+
+#############################################################
+# 5) Main loop: read, filter, summarize each sample
+#############################################################
+all_summaries <- list()
+for (smp in samples) {
+  bed_file <- file.path(data_dir, paste0(smp, ".bed"))
+  
+  # 5a) Read & Filter
+  filtered_gr <- read_and_filter_wgbs(bed_file, blacklist_gr)
+  
+  # 5b) Summarize
+  summary_dt <- summarize_wgbs(filtered_gr, sample_name = smp)
+  
+  all_summaries[[smp]] <- summary_dt
+}
+
+# Combine into a single data.table
+final_summary <- rbindlist(all_summaries, fill = TRUE)
+
+#############################################################
+# 6) Print (and optionally save) the summary
+#############################################################
+print(final_summary)
+
+# Optionally save to CSV
+# write.csv(final_summary, file = "WGBS_summary_postBlacklist.csv", row.names = FALSE)
+
+```
+
+
+```{r}
+# List of cancer types in order
+cancer_list <- c("COAD", "BLCA", "BRCA", "GBM", "KIRC", "KIRP", "LUAD", "SKCM")
+
+# Initialize a list to store the merged CTCF intervals for each cancer
+ctcf_merged_list <- list()
+
+# Step 1: Import and Process Motif Data for Each Cancer
+for (cancer in cancer_list) {
+  # Construct the file path
+  file_path <- paste0("data/", cancer, "_cleaned_motifs.csv")
+  
+  # Read the motif data
+  motif_data <- fread(file_path, header = TRUE)
+  
+  # Ensure column names are correct
+  if (!all(c("seqnames", "start", "end", "group_name") %in% colnames(motif_data))) {
+    colnames(motif_data) <- c("seqnames", "start", "end", "group_name")
+  }
+  
+  # Filter to keep only CTCF group
+  ctcf_data <- motif_data %>%
+    filter(group_name == "CTCF")
+  
+  # Check if any data is present
+  if (nrow(ctcf_data) == 0) {
+    message("No CTCF motifs found in ", cancer)
+    ctcf_merged_list[[cancer]] <- GRanges()  # Store an empty GRanges object
+    next
+  }
+  
+  # Adjust motif start positions for 1-based coordinates if necessary
+  # Uncomment the following line if your data is 0-based
+  # ctcf_data$start <- ctcf_data$start + 1  # Convert start to 1-based coordinates
+  
+  # Create GRanges object for CTCF motifs
+  ctcf_gr <- GRanges(
+    seqnames = ctcf_data$seqnames,
+    ranges = IRanges(start = ctcf_data$start, end = ctcf_data$end)
+  )
+  
+  # Ensure consistent chromosome naming
+  seqlevelsStyle(ctcf_gr) <- "UCSC"
+  
+  # Merge overlapping intervals
+  ctcf_gr_merged <- GenomicRanges::reduce(ctcf_gr)
+  
+  # Store the merged intervals in the list
+  ctcf_merged_list[[cancer]] <- ctcf_gr_merged
+}
+
+```
+
+```{r}
+# obtain the FIMO-intervals
+suppressMessages(library(AnnotationHub))
+ah <- AnnotationHub()
+query_data <- subset(ah, preparerclass == "CTCF")
+
+# Explore the AnnotationHub object
+query_data
+query_data$dataprovider %>% table()
+
+subset(query_data, species == "Homo sapiens" & 
+                   genome == "hg38" & 
+                   dataprovider == "JASPAR 2022")
+
+# CTCF-all motifs (FIMO)
+CTCF_hg38_all <- query_data[["AH104727"]]
+CTCF_hg38_reduce = GenomicRanges::reduce(CTCF_hg38_all)
+```
+
+```{r}
+
+###############################
+## 3. Create the union of all 8 cancer intervals
+###############################
+## We need to ensure we combine them in a GRangesList, unlist, then reduce:
+grl_all <- GRangesList(ctcf_merged_list[cancer_list])  # ensure the 8 cancers in order
+all_8_gr <- unlist(grl_all, use.names = FALSE)
+union_8_gr <- GenomicRanges::reduce(all_8_gr)
+
+## We'll use length(union_8_gr) as the denominator for columns 2 and 4
+
+###############################
+## 4. Define a helper function
+###############################
+## overlap_fimo() returns how many intervals in 'gr' overlap FIMO intervals
+overlap_fimo <- function(gr, fimo_gr) {
+  if (length(gr) == 0) return(0L)
+  hits <- findOverlaps(gr, fimo_gr)
+  length(unique(queryHits(hits)))
+}
+
+###############################
+## 5. Build the table for each of the 8 cancers + 1 row for union
+###############################
+results_dt <- data.frame(
+  Cancer_Type = character(),
+  Num_TFBS = integer(),
+  Pct_of_Union = numeric(),
+  Num_FIMO_Overlap = integer(),
+  Pct_of_Union_FIMO = numeric(),
+  stringsAsFactors = FALSE
+)
+
+union_len <- length(union_8_gr)  # denominator for columns 2 and 4
+
+for (cancer in cancer_list) {
+  gr_cancer <- ctcf_merged_list[[cancer]]
+  if (length(gr_cancer) == 0) {
+    # No intervals for this cancer, skip or report zero
+    results_dt <- rbind(
+      results_dt,
+      data.frame(
+        Cancer_Type = cancer,
+        Num_TFBS = 0,
+        Pct_of_Union = 0,
+        Num_FIMO_Overlap = 0,
+        Pct_of_Union_FIMO = 0,
+        stringsAsFactors = FALSE
+      )
+    )
+    next
+  }
+
+  # 1) Number of intervals in this cancer
+  n_intervals <- length(gr_cancer)
+
+  # 2) % of union => ( n_intervals / union_len ) * 100
+  pct_union <- if (union_len > 0) (n_intervals / union_len) * 100 else 0
+
+  # 3) # intervals that also overlap FIMO
+  n_fimo <- overlap_fimo(gr_cancer, CTCF_hg38_reduce)
+
+  # 4) % of union after restricting to FIMO => ( n_fimo / union_len ) * 100
+  pct_union_fimo <- if (union_len > 0) (n_fimo / union_len) * 100 else 0
+
+  results_dt <- rbind(
+    results_dt,
+    data.frame(
+      Cancer_Type = cancer,
+      Num_TFBS = n_intervals,
+      Pct_of_Union = pct_union,
+      Num_FIMO_Overlap = n_fimo,
+      Pct_of_Union_FIMO = pct_union_fimo,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+###############################
+## 6. Add the row for the union of all 8 cancers
+###############################
+# (Row 9)
+n_intervals_union <- length(union_8_gr)
+pct_union_union <- 100  # Union is 100% of itself
+# Overlap with FIMO for the union
+n_fimo_union <- overlap_fimo(union_8_gr, CTCF_hg38_reduce)
+pct_union_fimo_union <- if (n_intervals_union > 0) (n_fimo_union / n_intervals_union) * 100 else 0
+
+results_dt <- rbind(
+  results_dt,
+  data.frame(
+    Cancer_Type = "Union_of_8",
+    Num_TFBS = n_intervals_union,
+    Pct_of_Union = pct_union_union,
+    Num_FIMO_Overlap = n_fimo_union,
+    Pct_of_Union_FIMO = pct_union_fimo_union,
+    stringsAsFactors = FALSE
+  )
+)
+
+###############################
+## 7. Final results table
+###############################
+# (1) # TFBS intervals
+# (2) % of union
+# (3) # intervals that also overlap FIMO
+# (4) % of union after restricting to FIMO
+#
+# We have them in the results_dt as:
+# Cancer_Type, Num_TFBS, Pct_of_Union, Num_FIMO_Overlap, Pct_of_Union_FIMO
+#
+# If you prefer a different column naming, just rename them:
+colnames(results_dt) <- c("Cancer_Type", "# TFBS intervals", "% of Union",
+                          "# Overlap FIMO", "% of Union (FIMO)")
+
+# Print
+print(results_dt)
+
+# Optionally save to CSV
+#write.csv(results_dt, "Table2_TFBS_CTCF_FIMO.csv", row.names = FALSE)
+```
+

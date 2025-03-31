@@ -1,0 +1,164 @@
+---
+title: "WGBS_pwd_comparision"
+output: html_document
+date: "2025-02-20"
+---
+
+```{r, warning=FALSE, message=FALSE}
+############################################################
+## 0) Libraries and Sample Lists
+############################################################
+library(data.table)
+library(GenomicRanges)
+library(GenomeInfoDb)
+library(dplyr)
+
+read_bed_as_granges <- function(bed_file) {
+  df <- fread(bed_file, header=FALSE, showProgress=FALSE)
+  colnames(df) <- c("chrom","start","end","beta","coverage","methylated","unmethylated")
+  gr <- GRanges(
+    seqnames = df$chrom,
+    ranges   = IRanges(start=df$start, end=df$end),
+    strand   = "*"
+  )
+  mcols(gr)$coverage    <- df$coverage
+  mcols(gr)$methylated  <- df$methylated
+  mcols(gr)$beta        <- df$beta
+  mcols(gr)$unmethylated<- df$unmethylated
+  seqlevelsStyle(gr) <- "UCSC"
+  gr <- keepSeqlevels(gr, standardChromosomes(gr), pruning.mode="coarse")
+  gr
+}
+
+
+compute_pwd_for_two_samples_random <- function(
+  smpA, smpB, meth_gr_list,
+  coverage_min=5,
+  n_random=1e5
+) {
+  # Grab sample A intervals
+  grA <- meth_gr_list[[smpA]]
+  # Grab sample B intervals
+  grB <- meth_gr_list[[smpB]]
+  
+  N <- length(grA)
+  cat("Total intervals in sample A (", smpA, "):", N, "\n")
+  
+  # 1) If N < n_random, use them all; else sample 100k
+  if (N <= n_random) {
+    idx_sample <- seq_len(N)
+  } else {
+    idx_sample <- sample.int(N, n_random, replace=FALSE)
+  }
+  
+  grA_rand <- grA[idx_sample]
+  cat("Random sample of intervals selected:", length(grA_rand), "\n")
+  
+  # 2) We'll build a data.table with columns: idxA, pwd
+  result_dt <- data.table(
+    idxA   = idx_sample,
+    pwd    = NA_real_
+  )
+  
+  # Overlaps for B
+  # We'll do it interval by interval in the naive approach:
+  # But that's 100k intervals => feasible in memory but might be slow. 
+  # We'll do a findOverlaps for all at once:
+  ovB <- findOverlaps(grA_rand, grB)
+  
+  # coverage in A
+  covA_rand  <- mcols(grA_rand)$coverage
+  methA_rand <- mcols(grA_rand)$methylated
+  
+  # coverage in B
+  covB_full  <- mcols(grB)$coverage
+  methB_full <- mcols(grB)$methylated
+  
+  # For each interval i in grA_rand, we sum coverage in B using hits:
+  # We'll group by queryHits(ovB)
+  ovB_dt <- data.table(
+    query = queryHits(ovB),
+    subj  = subjectHits(ovB)
+  )
+  # Summarize coverage in B for each query
+  # e.g. sum coverage, sum methylation
+  ovB_dt <- ovB_dt[, .(
+    sum_covB = sum(covB_full[subj]),
+    sum_methB= sum(methB_full[subj])
+  ), by=query]
+  
+  # Now we match that back to intervals i
+  for (i in seq_along(grA_rand)) {
+    # coverage in sample A
+    sum_covA <- covA_rand[i]
+    if (sum_covA < coverage_min) {
+      next
+    }
+    
+    # find row in ovB_dt for i
+    rowb <- ovB_dt[query==i]
+    if (nrow(rowb)==0) {
+      next  # no overlap in B => coverage=0
+    }
+    sum_covB  <- rowb$sum_covB[1]
+    sum_methB <- rowb$sum_methB[1]
+    if (sum_covB < coverage_min) {
+      next
+    }
+    
+    sum_methA <- methA_rand[i]
+    poolbetaA <- sum_methA / sum_covA
+    poolbetaB <- sum_methB / sum_covB
+    
+    result_dt$pwd[i] <- abs(poolbetaA - poolbetaB)
+  }
+  
+  # remove intervals with no PWD
+  result_dt <- result_dt[!is.na(pwd)]
+  # Add a pair label
+  result_dt[, pair := paste0(smpA,"_vs_",smpB)]
+  
+  result_dt
+}
+
+# Suppose we have meth_gr_list for all samples
+pairsDt <- data.table()
+
+# Normal pair
+res_norm <- compute_pwd_for_two_samples_random("JN","IN", meth_gr_list, coverage_min=5, n_random=1e5)
+pairsDt <- rbind(pairsDt, res_norm, fill=TRUE)
+
+cancer_pairs <- list(
+  c("JA","JB"),
+  c("IA","IB"),
+  c("DA","DB"),
+  c("HA","HB"),
+  c("MA","MB")
+)
+for (cp in cancer_pairs) {
+  A <- cp[[1]]
+  B <- cp[[2]]
+  cat("\nComputing random-sample PWD for", A,"vs", B, "...\n")
+  res_cc <- compute_pwd_for_two_samples_random(A, B, meth_gr_list, coverage_min=5, n_random=1e5)
+  pairsDt <- rbind(pairsDt, res_cc, fill=TRUE)
+}
+
+cat("pairsDt total rows:", nrow(pairsDt), "\n")
+
+# Summarize
+genome_summary <- pairsDt %>%
+  group_by(pair) %>%
+  summarize(
+    n_intervals = n(),
+    avg_pwd     = mean(pwd, na.rm=TRUE),
+    median_pwd  = median(pwd, na.rm=TRUE),
+    .groups="drop"
+  )
+
+genome_summary
+
+
+```
+
+
+
