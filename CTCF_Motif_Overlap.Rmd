@@ -1,0 +1,1201 @@
+---
+title: "CTCF_Motif_overlap"
+output: html_document
+date: "2025-02-27"
+---
+
+
+```{r libraries, message=FALSE,warning=FALSE}
+
+library(data.table)
+library(Biostrings)
+library(ComplexHeatmap)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(GenomeInfoDb)
+library(rtracklayer)
+library(GenomicRanges)
+library(S4Vectors)
+```
+
+
+```{r}
+# List of cancer types in order
+cancer_list <- c("COAD", "BLCA", "BRCA", "GBM", "KIRC", "KIRP", "LUAD", "SKCM")
+
+# Initialize a list to store the merged CTCF intervals for each cancer
+ctcf_merged_list <- list()
+
+# Step 1: Import and Process Motif Data for Each Cancer
+for (cancer in cancer_list) {
+  # Construct the file path
+  file_path <- paste0("data/", cancer, "_cleaned_motifs.csv")
+  
+  # Read the motif data
+  motif_data <- fread(file_path, header = TRUE)
+  
+  # Ensure column names are correct
+  if (!all(c("seqnames", "start", "end", "group_name") %in% colnames(motif_data))) {
+    colnames(motif_data) <- c("seqnames", "start", "end", "group_name")
+  }
+  
+  # Filter to keep only CTCF group
+  ctcf_data <- motif_data %>%
+    filter(group_name == "CTCF")
+  
+  # Check if any data is present
+  if (nrow(ctcf_data) == 0) {
+    message("No CTCF motifs found in ", cancer)
+    ctcf_merged_list[[cancer]] <- GRanges()  # Store an empty GRanges object
+    next
+  }
+  
+  # Adjust motif start positions for 1-based coordinates if necessary
+  # Uncomment the following line if your data is 0-based
+  # ctcf_data$start <- ctcf_data$start + 1  # Convert start to 1-based coordinates
+  
+  # Create GRanges object for CTCF motifs
+  ctcf_gr <- GRanges(
+    seqnames = ctcf_data$seqnames,
+    ranges = IRanges(start = ctcf_data$start, end = ctcf_data$end)
+  )
+  
+  # Ensure consistent chromosome naming
+  seqlevelsStyle(ctcf_gr) <- "UCSC"
+  
+  # Merge overlapping intervals
+  ctcf_gr_merged <-  GenomicRanges::reduce(ctcf_gr)
+  
+  # Store the merged intervals in the list
+  ctcf_merged_list[[cancer]] <- ctcf_gr_merged
+}
+```
+
+
+```{r}
+############################################
+## 1) Setup
+############################################
+
+# We assume you have:
+#   cancer_list <- c("COAD","BLCA","BRCA","GBM","KIRC","KIRP","LUAD","SKCM")
+#   ctcf_merged_list: a named list of GRanges for each cancer
+
+coad <- ctcf_merged_list[["COAD"]]
+others_list <- ctcf_merged_list[ setdiff(cancer_list, "COAD") ]
+
+############################################
+## 2) Count Overlaps for Each COAD Interval in a Single Pass
+############################################
+
+# We want to see how many of the 7 "others" each COAD interval partially overlaps.
+# We'll keep an integer vector overlap_counts, size = length(coad),
+# then for each "other" GRanges, we findOverlaps(coad, that other),
+# and increment overlap_counts for all intervals that matched.
+
+overlap_counts <- integer(length(coad))  # track how many other-cancers each COAD interval hits
+
+for (nm in names(others_list)) {
+  other_gr <- others_list[[nm]]
+  ov <- findOverlaps(coad, other_gr)
+  # queryHits(ov) are the indices in coad that overlap 'other_gr'
+  overlap_counts[unique(queryHits(ov))] <- overlap_counts[unique(queryHits(ov))] + 1
+}
+
+############################################
+## 3) Classify Each COAD Interval
+############################################
+
+# We define:
+#   if overlap_count == 0 -> "coad_only"
+#   if overlap_count == 7 -> "common_all_8"
+#   else -> "coad_plus_others"
+
+n_coad <- length(coad)
+category_of <- character(n_coad)
+
+for (i in seq_len(n_coad)) {
+  oc <- overlap_counts[i]
+  if (oc == 0) {
+    category_of[i] <- "coad_only"
+  } else if (oc == 7) {
+    category_of[i] <- "common_all_8"
+  } else {
+    category_of[i] <- "coad_plus_others"
+  }
+}
+
+coad_only        <- coad[category_of=="coad_only"]
+common_all_8     <- coad[category_of=="common_all_8"]
+coad_plus_others <- coad[category_of=="coad_plus_others"]
+
+cat("coad_only:        ", length(coad_only), "\n")
+cat("common_all_8:     ", length(common_all_8), "\n")
+cat("coad_plus_others: ", length(coad_plus_others), "\n")
+cat("Sum check vs coad:", length(coad_only) + length(common_all_8) + length(coad_plus_others),
+    " / ", length(coad), "\n\n")
+
+############################################
+## 4) Construct all_w_o_coad
+############################################
+## We gather the intervals from the other 7 sets
+## then remove any that partially overlap COAD
+
+# (A) Combine 'others' into one big set. 
+
+# 1) Start with the first GRanges
+others_merged <- others_list[[1]]
+
+# 2) Combine each subsequent GRanges one by one
+for (k in seq(2, length(others_list))) {
+  others_merged <- c(others_merged, others_list[[k]])  
+  # This ensures the S4 method c,GRanges,GRanges is called, producing a GRanges
+}
+
+# 3) Then call 'reduce'
+all_others_reduced <-  GenomicRanges::reduce(others_merged)
+
+filter_out_overlap <- function(x, y) {
+  if (length(x) == 0) return(x)
+  ov <- findOverlaps(x, y)
+  remove_idx <- unique(queryHits(ov))
+  if (length(remove_idx) == 0) {
+    return(x)
+  }
+  keep_idx <- setdiff(seq_along(x), remove_idx)
+  x[keep_idx]
+}
+
+all_w_o_coad <- filter_out_overlap(all_others_reduced, coad)
+cat("all_w_o_coad intervals:", length(all_w_o_coad), "\n")
+
+
+# Now we have 4 disjoint sets: 
+#    common_all_8_overlap, coad_plus_others_overlap, coad_only_overlap, all_w_o_coad_overlap
+
+############################################
+## 2. Prepare the 4 Groups in a Named List
+############################################
+ctcf_4groups <- list(
+  "common_all_8"    = common_all_8,
+  "coad_plus_others" = coad_plus_others,
+  "coad_only"       = coad_only,
+  "all_w_o_coad"    = all_w_o_coad
+)
+
+
+```
+
+```{r}
+c(
+  common_all_8 = length(common_all_8),
+  coad_plus_others = length(coad_plus_others),
+  coad_only = length(coad_only),
+  all_w_o_coad = length(all_w_o_coad)
+)
+
+length(GenomicRanges::intersect(common_all_8, coad_only))      # 0 if disjoint
+length(GenomicRanges::intersect(common_all_8, all_w_o_coad))   # 0
+length(GenomicRanges::intersect(coad_plus_others, coad_only))  # 0
+# etc...
+
+partial_union <- c(common_all_8,
+                   coad_plus_others,
+                   coad_only,
+                   all_w_o_coad)
+
+total_partial_intervals <- length(partial_union)
+total_length <- length(all_w_o_coad)+length(common_all_8)+length(coad_only)+length(coad_plus_others)
+cat("Sum of intervals across the 4 partial-overlap groups:", total_partial_intervals, "\n")
+cat("Sum of length for 4 partial-overlap groups:", total_length, "\n")
+```
+
+
+```{r}
+# obtain the FIMO-intervals
+suppressMessages(library(AnnotationHub))
+ah <- AnnotationHub()
+query_data <- subset(ah, preparerclass == "CTCF")
+
+# Explore the AnnotationHub object
+query_data
+query_data$dataprovider %>% table()
+
+subset(query_data, species == "Homo sapiens" & 
+                   genome == "hg38" & 
+                   dataprovider == "JASPAR 2022")
+
+# CTCF-all motifs (FIMO)
+CTCF_hg38_all <- query_data[["AH104727"]]
+CTCF_hg38_reduce =  GenomicRanges::reduce(CTCF_hg38_all)
+CTCF_hg38_reduce
+```
+
+```{r}
+coad_only$ctcf_idx <- paste0("coad_only_", seq_along(coad_only))
+common_all_8$ctcf_idx <- paste0("common_all_8_", seq_along(common_all_8))
+coad_plus_others$ctcf_idx <- paste0("coad_plus_others_", seq_along(coad_plus_others))
+all_w_o_coad$ctcf_idx <- paste0("all_w_o_coad_", seq_along(all_w_o_coad))
+
+# mcols(coad_only)
+# mcols(common_all_8)
+# mcols(coad_plus_others)
+# mcols(all_w_o_coad)
+
+```
+
+```{r}
+# ############################################################
+# ## 0. Load Packages & Prepare Objects
+# ############################################################
+# 
+# 
+# # Assume you have:
+# #   1) coad_only, common_all_8, coad_plus_others, all_w_o_coad
+# #      Each is a GRanges object with a 'ctcf_idx' metadata column
+# #      e.g.: coad_only$ctcf_idx, etc.
+# #
+# #   2) FIMO intervals in a GRanges: CTCF_hg38_reduce
+# #   3) Methylation data for DA in meth_gr_DA
+# #   4) Methylation data for DB in meth_gr_DB
+# #
+# # All with consistent seqlevelsStyle(...)= "UCSC" if needed.
+# 
+# ############################################################
+# ## 1. (Optional) Filter the Four Groups by FIMO Overlap
+# ##    If you do NOT want to apply the FIMO filter, skip this step
+# ############################################################
+# filter_by_fimo <- function(gr, fimo_gr) {
+#   if (length(gr) == 0) return(GRanges())
+#   hits <- findOverlaps(gr, fimo_gr)
+#   keep_idx <- unique(queryHits(hits))
+#   gr[keep_idx]
+# }
+# 
+# # If you want to filter by FIMO:
+# coad_only_fimo        <- filter_by_fimo(coad_only, CTCF_hg38_reduce)
+# common_all_8_fimo     <- filter_by_fimo(common_all_8, CTCF_hg38_reduce)
+# coad_plus_others_fimo <- filter_by_fimo(coad_plus_others, CTCF_hg38_reduce)
+# all_w_o_coad_fimo     <- filter_by_fimo(all_w_o_coad, CTCF_hg38_reduce)
+# 
+# # ...or if you want the unfiltered sets, you can just keep the original objects.
+# # For demonstration, let's use the FIMO-filtered versions:
+# coad_only_gr        <- coad_only_fimo
+# common_all_8_gr     <- common_all_8_fimo
+# coad_plus_others_gr <- coad_plus_others_fimo
+# all_w_o_coad_gr     <- all_w_o_coad_fimo
+# 
+# ############################################################
+# ## 2. A Helper Function to Summarize Methylation Data
+# ##    For a Single Group (DA or DB)
+# ############################################################
+# summarize_meth_for_group <- function(gr_group, meth_gr) {
+#   if (length(gr_group) == 0) return(data.table())
+# 
+#   hits <- findOverlaps(gr_group, meth_gr)
+#   if (length(hits) == 0) return(data.table())
+# 
+#   grp_idx <- queryHits(hits)      # index into gr_group
+#   meth_idx <- subjectHits(hits)   # index into meth_gr
+# 
+#   # Extract overlap methylation data
+#   meth_overlaps <- meth_gr[meth_idx]
+#   
+#   # Keep ctcf_idx from the intervals
+#   # (assuming the intervals have ctcf_idx in mcols)
+#   mcols(meth_overlaps)$ctcf_idx <- gr_group$ctcf_idx[grp_idx]
+#   
+#   # Convert to data.table
+#   dt <- as.data.table(mcols(meth_overlaps))
+#   
+#   # If coverage is stored in dt$coverage, let's define dt$depth
+#   dt$depth <- dt$coverage
+#   
+#   # Summarize by ctcf_idx
+#   sum_dt <- dt[, .(
+#     nCpG = .N,
+#     summ = sum(methylated),     # sum of methylated reads
+#     sum_coverage = sum(coverage),
+#     # You can also store other stats if you want
+#     uncovered = sum(depth < 5)
+#   ), by = ctcf_idx]
+# 
+#   # poolbeta
+#   sum_dt$poolbeta <- sum_dt$summ / sum_dt$sum_coverage
+# 
+#   sum_dt
+# }
+
+# ############################################################
+# ## 3. For Each Group, Summarize DA & DB, Then Merge & Compute PWD
+# ############################################################
+# compute_pwd_for_group <- function(gr_group, meth_gr_DA, meth_gr_DB, group_name) {
+#   # Summarize DA
+#   da_dt <- summarize_meth_for_group(gr_group, meth_gr_DA)
+#   colnames(da_dt) <- c("ctcf_idx", "nCpG", "summ", "sum_coverage", "uncovered", "poolbeta")
+#   # rename columns to avoid conflict
+#   colnames(da_dt)[3:6] <- paste0("da.", colnames(da_dt)[3:6])
+# 
+#   # Summarize DB
+#   db_dt <- summarize_meth_for_group(gr_group, meth_gr_DB)
+#   colnames(db_dt) <- c("ctcf_idx", "nCpG", "summ", "sum_coverage", "uncovered", "poolbeta")
+#   colnames(db_dt)[3:6] <- paste0("db.", colnames(db_dt)[3:6])
+# 
+#   # Merge on ctcf_idx
+#   merged_dt <- merge(da_dt, db_dt, by = c("ctcf_idx", "nCpG"), all = FALSE)
+# 
+#   # Compute pairwise difference
+#   merged_dt$pwd <- abs(merged_dt$da.poolbeta - merged_dt$db.poolbeta)
+# 
+#   # Optionally compute Brown & Li's 95% CI if you want
+#   p1prime <- (merged_dt$da.summ + 0.5) / (merged_dt$da.sum_coverage + 1)
+#   p2prime <- (merged_dt$db.summ + 0.5) / (merged_dt$db.sum_coverage + 1)
+#   varp1prime <- p1prime * (1 - p1prime) / merged_dt$da.sum_coverage
+#   varp2prime <- p2prime * (1 - p2prime) / merged_dt$db.sum_coverage
+#   sddiff <- sqrt(varp1prime + varp2prime)
+#   merged_dt$ubdiff <- abs(p1prime - p2prime) + 1.96 * sddiff
+#   
+#   # Add group label
+#   merged_dt$cancer_type <- group_name
+# 
+#   merged_dt
+# }
+# 
+# ############################################################
+# ## 4. Put It All Together for the 4 Groups
+# ############################################################
+# pairs_list <- list()
+# 
+# pairs_list[["common_all_8"]]    <- compute_pwd_for_group(common_all_8_gr, meth_gr_DA, meth_gr_DB, "common_all_8")
+# pairs_list[["coad_only"]]       <- compute_pwd_for_group(coad_only_gr, meth_gr_DA, meth_gr_DB, "coad_only")
+# pairs_list[["coad_plus_others"]]<- compute_pwd_for_group(coad_plus_others_gr, meth_gr_DA, meth_gr_DB, "coad_plus_others")
+# pairs_list[["all_w_o_coad"]]    <- compute_pwd_for_group(all_w_o_coad_gr, meth_gr_DA, meth_gr_DB, "all_w_o_coad")
+# 
+# pairsDt_final <- rbindlist(pairs_list, fill = TRUE)
+# 
+# ############################################################
+# ## 5. Filter Coverage if Desired, Then Summarize
+# ############################################################
+# pairsDt_final_filtered <- pairsDt_final[
+#   da.sum_coverage > 4 & db.sum_coverage > 4 & 
+#   !is.na(pwd) & is.finite(pwd)
+# ]
+# 
+# # Summarize average PWD for each group
+# fimo_pwd_summary <- pairsDt_final_filtered %>%
+#   group_by(cancer_type) %>%
+#   summarize(
+#     n_intervals = n(),
+#     avg_pwd = mean(pwd, na.rm = TRUE)
+#     # ... you can store avg ubdiff or other stats
+#   ) %>%
+#   arrange(avg_pwd)
+# 
+# print(fimo_pwd_summary)
+```
+
+
+
+```{r}
+
+# 1) We have 2 normal samples: JN, IN
+#    5 cancer pairs: (JA, JB), (IA, IB), (DA, DB), (HA, HB), (MA, MB)
+# => total 12 bed files
+
+all_samples <- c("JN","IN","JA","JB","IA","IB","DA","DB","HA","HB","MA","MB")
+
+meth_gr_list <- list()
+for (smp in all_samples) {
+  bed_file <- file.path("data", paste0(smp, ".bed"))
+  cat("Reading", bed_file, "...\n")
+  
+  # Read the .bed
+  df <- fread(bed_file, header = FALSE)
+  # columns: chrom, start, end, beta, coverage, methylated, unmethylated
+  colnames(df) <- c("chrom","start","end","beta","coverage","methylated","unmethylated")
+  
+  # Convert to GRanges
+  gr <- GRanges(
+    seqnames = df$chrom,
+    ranges   = IRanges(start=df$start, end=df$end),
+    strand   = "*"
+  )
+  mcols(gr)$beta        <- df$beta
+  mcols(gr)$coverage    <- df$coverage
+  mcols(gr)$methylated  <- df$methylated
+  mcols(gr)$unmethylated<- df$unmethylated
+  
+  seqlevelsStyle(gr) <- "UCSC"  # unify naming
+  
+  meth_gr_list[[smp]] <- gr
+}
+
+cat("Done reading all samples.\n")
+
+```
+```{r}
+# B) Four TFBS Groups
+
+coad_only$ctcf_idx        <- paste0("coad_only_", seq_along(coad_only))
+common_all_8$ctcf_idx     <- paste0("common_all_8_", seq_along(common_all_8))
+coad_plus_others$ctcf_idx <- paste0("coad_plus_others_", seq_along(coad_plus_others))
+all_w_o_coad$ctcf_idx     <- paste0("all_w_o_coad_", seq_along(all_w_o_coad))
+
+tfbs_groups_list <- list(
+  "coad_only"        = coad_only,
+  "common_all_8"     = common_all_8,
+  "coad_plus_others" = coad_plus_others,
+  "all_w_o_coad"     = all_w_o_coad
+)
+```
+
+
+```{r}
+# C) Summarizing Methylation & Computing PWD for Each Pair
+# Define a function to handle the summarization for one sample and one TFBS group:
+
+summarize_meth_for_group <- function(gr_group, meth_gr) {
+  if (length(gr_group) == 0) return(data.table())
+  
+  ov <- findOverlaps(gr_group, meth_gr)
+  if (length(ov)==0) return(data.table())
+  
+  grp_idx  <- queryHits(ov)   # index into gr_group
+  meth_idx <- subjectHits(ov) # index into meth_gr
+  
+  dt <- as.data.table(mcols(meth_gr[meth_idx]))
+  dt$ctcf_idx <- mcols(gr_group)$ctcf_idx[grp_idx]  # carry the interval's ID
+  
+  # Summarize coverage across that entire interval
+  sum_dt <- dt[, .(
+    nCpG        = .N,
+    sum_methyl  = sum(methylated),
+    sum_cov     = sum(coverage)
+  ), by=ctcf_idx]
+  
+  sum_dt$poolbeta <- sum_dt$sum_methyl / sum_dt$sum_cov
+  sum_dt
+}
+
+compute_pwd_for_pair <- function(sampleA, sampleB, 
+                                 tfbs_groups_list, 
+                                 meth_gr_list) {
+  # We'll produce one data.table with columns:
+  #   ctcf_idx, group_name, nCpG, sum_cov_A, sum_cov_B, poolbetaA, poolbetaB, pwd
+  # plus a "pair" column for labeling.
+  
+  res_list <- list()
+  for (grp_nm in names(tfbs_groups_list)) {
+    gr_group <- tfbs_groups_list[[grp_nm]]
+    
+    dtA <- summarize_meth_for_group(gr_group, meth_gr_list[[sampleA]])
+    dtB <- summarize_meth_for_group(gr_group, meth_gr_list[[sampleB]])
+    
+    # rename columns in dtA
+    colnames(dtA) <- c("ctcf_idx","nCpG","da.sum_meth","da.sum_cov","da.poolbeta")
+    colnames(dtB) <- c("ctcf_idx","nCpG","db.sum_meth","db.sum_cov","db.poolbeta")
+    
+    # Merge
+    merged_dt <- merge(dtA, dtB, by=c("ctcf_idx","nCpG"))
+    merged_dt$pwd <- abs(merged_dt$da.poolbeta - merged_dt$db.poolbeta)
+    merged_dt$group_name <- grp_nm
+    
+    res_list[[grp_nm]] <- merged_dt
+  }
+  out_dt <- data.table::rbindlist(res_list, fill=TRUE)
+  out_dt$pair <- paste0(sampleA,"_vs_",sampleB)
+  out_dt
+}
+
+# We have 5 cancer pairs + 1 normal pair: total 6 pairs.
+cancer_pairs <- list(
+  c("JA","JB"),
+  c("IA","IB"),
+  c("DA","DB"),
+  c("HA","HB"),
+  c("MA","MB")
+)
+normal_pair <- c("JN","IN")
+
+pairsDt <- data.table()
+
+# 1) Normal pair
+res_norm <- compute_pwd_for_pair(normal_pair[1], normal_pair[2], 
+                                 tfbs_groups_list, meth_gr_list)
+pairsDt <- rbind(pairsDt, res_norm, fill=TRUE)
+
+# 2) Cancer pairs
+for (cp in cancer_pairs) {
+  A <- cp[1]; B <- cp[2]
+  cat("Processing pair:", A, B,"\n")
+  res_cc <- compute_pwd_for_pair(A, B, tfbs_groups_list, meth_gr_list)
+  pairsDt <- rbind(pairsDt, res_cc, fill=TRUE)
+}
+
+cat("Final pairsDt has", nrow(pairsDt), "rows\n")
+
+
+```
+```{r}
+# Suppose we have a GRanges CTCF_hg38_reduce for the FIMO sites
+# We'll create a map of which ctcf_idx overlap FIMO, per group. 
+# Alternatively, you can do an approach that merges them in each group.
+
+fimo_boolean <- function(gr_group, fimo_gr) {
+  hits <- findOverlaps(gr_group, fimo_gr)
+  overlap_idx <- unique(queryHits(hits))
+  fimo_vec <- rep(FALSE, length(gr_group))
+  fimo_vec[overlap_idx] <- TRUE
+  fimo_vec
+}
+
+# Build a dictionary: for each group, for each ctcf_idx, isFimo?
+fimo_map <- list()
+for (grp_nm in names(tfbs_groups_list)) {
+  gr_g <- tfbs_groups_list[[grp_nm]]
+  if (length(gr_g)>0) {
+    fimo_vec <- fimo_boolean(gr_g, CTCF_hg38_reduce)
+    fimo_map[[grp_nm]] <- data.frame(
+      ctcf_idx = mcols(gr_g)$ctcf_idx,
+      fimo     = fimo_vec,
+      stringsAsFactors=FALSE
+    )
+  } else {
+    fimo_map[[grp_nm]] <- data.frame(
+      ctcf_idx=character(0), fimo=logical(0)
+    )
+  }
+}
+
+# Convert each to a single big map
+fimo_map_dt <- data.table::rbindlist(
+  lapply(names(fimo_map), function(nm) {
+    df <- fimo_map[[nm]]
+    df$group_name <- nm
+    df
+  }),
+  fill=TRUE
+)
+
+# Now merge pairsDt with fimo_map_dt by (ctcf_idx, group_name)
+pairsDt2 <- merge(
+  pairsDt,
+  fimo_map_dt,
+  by=c("ctcf_idx","group_name"),
+  all.x=TRUE
+)
+pairsDt2$fimo[is.na(pairsDt2$fimo)] <- FALSE  # intervals not in the map -> no FIMO
+pairsDt2$fimo <- as.logical(pairsDt2$fimo)
+
+```
+
+```{r}
+pairsDt2 <- pairsDt2 %>%
+  mutate(
+    # rename 'group_name' -> 'rank' or something
+    rank = factor(group_name, 
+                  levels=c("all_w_o_coad","coad_only","coad_plus_others","common_all_8")),
+    # maybe define a numeric rank or keep it factor
+    nCpG_factor = ifelse(nCpG > 3, "4+", as.character(nCpG))
+  )
+
+```
+
+
+```{r}
+pairsDt2 <- pairsDt2 %>%
+  mutate(
+    # coad_binary=TRUE if rank is any of coad_unique, coad_plus, pan_cancer
+    coad_binary = ifelse(rank=="all_w_o_coad", 0, 1)
+  )
+
+pairsDt2 <- pairsDt2 %>%
+  mutate(
+    rankInt = case_when(
+      rank=="all_w_o_coad"   ~ 0,
+      rank=="coad_only" ~ 1,
+      rank=="coad_plus_others"   ~ 2,
+      rank=="common_all_8"  ~ 3,
+      TRUE ~ NA_real_
+    )
+  )
+
+library(dplyr)
+library(broom)  # for tidy()
+
+fit_model1 <- function(df) {
+  # df has columns: coad_binary (0 or 1), nCpG, pwd
+  # Model 1: pwd ~ coad_binary + nCpG
+  # We want the slope for coad_binary (b1).
+  fit <- lm(pwd ~ coad_binary + nCpG, data=df)
+  co <- broom::tidy(fit)
+  # co has rows for (Intercept), coad_binary, nCpG
+  # We want the row term=="coad_binary" for estimate + se
+  row_coad <- co[co$term=="coad_binary",]
+  
+  # Return a data.frame with b1, se(b1), maybe p-value
+  data.frame(
+    b1   = row_coad$estimate,
+    seb1 = row_coad$std.error,
+    pval = row_coad$p.value
+  )
+}
+
+fit_model2 <- function(df) {
+  # df has columns: rankInt in {0,1,2,3}, nCpG, pwd
+  # Model 2: pwd ~ rankInt + nCpG
+  fit <- lm(pwd ~ rankInt + nCpG, data=df)
+  co <- broom::tidy(fit)
+  # co has rows for (Intercept), rankInt, nCpG
+  row_trend <- co[co$term=="rankInt",]
+  data.frame(
+    trend_b1      = row_trend$estimate,
+    se_trend_b1   = row_trend$std.error,
+    pval_trend_b1 = row_trend$p.value
+  )
+}
+
+# We'll create two final data frames: model1_df, model2_df
+model1_list <- list()
+model2_list <- list()
+
+# 2) We group pairsDt2 by 'pair' and run each model on that subset:
+pair_names <- unique(pairsDt2$pair)
+
+for (pname in pair_names) {
+  subdf <- subset(pairsDt2, pair==pname)
+  
+  # Model 1
+  m1res <- fit_model1(subdf)
+  m1res$samplepair <- pname
+  
+  # If you have a separate pair_info table for tissue_type, merge:
+  # or do:
+  tissue_type <- if(grepl("JN_vs_IN", pname)) "non-cancer" else "cancer"
+  m1res$tissue_type <- tissue_type
+  
+  model1_list[[pname]] <- m1res
+  
+  # Model 2
+  m2res <- fit_model2(subdf)
+  m2res$samplepair <- pname
+  m2res$tissue_type <- tissue_type
+  
+  model2_list[[pname]] <- m2res
+}
+
+model1_df <- dplyr::bind_rows(model1_list)
+model2_df <- dplyr::bind_rows(model2_list)
+
+
+```
+
+```{r}
+model1_df
+model2_df
+```
+```{r}
+library(dplyr)
+
+####################################
+# 1) Mark which intervals have (or don't have) PWD
+####################################
+pairsDt2 <- pairsDt2 %>%
+  mutate(
+    # Instead of is.na(pwd), we check if pwd == 0 means "no PWD"
+    has_pwd = (pwd != 0)    # TRUE if pwd is nonzero
+  )
+
+####################################
+# 2) Summarize counts by (pair, group_name, fimo)
+####################################
+summ_table <- pairsDt2 %>%
+  group_by(pair, group_name, fimo) %>%
+  summarize(
+    n_total       = n(),
+    n_has_pwd     = sum(has_pwd),       # how many intervals had a nonzero pwd
+    n_missing_pwd = sum(!has_pwd),      # zero pwd
+    .groups = "drop"
+  )
+
+####################################
+# 3) Pivot or build sub-tables
+####################################
+# e.g. rename group_name for display
+display_map <- c(
+  "all_w_o_coad"     = "Non-colon",
+  "coad_only"        = "Colon-unique",
+  "coad_plus_others" = "Colon-plus",
+  "common_all_8"     = "Pan-cancer"
+)
+
+make_table_for_pair <- function(df_subset) {
+  df_subset <- df_subset %>%
+    mutate(
+      group_name = display_map[group_name],
+      fimo_col   = ifelse(fimo, "FIMO_TRUE", "FIMO_FALSE")
+    )
+  
+  df_subset %>%
+    select(group_name, fimo_col, n_total, n_has_pwd, n_missing_pwd) %>%
+    tidyr::pivot_wider(
+      id_cols = group_name,
+      names_from = fimo_col,
+      values_from = c(n_total, n_has_pwd, n_missing_pwd)
+    )
+}
+
+pair_list <- unique(summ_table$pair)
+all_pair_tables <- list()
+
+for (pname in pair_list) {
+  sub <- filter(summ_table, pair == pname)
+  wdf <- make_table_for_pair(sub)
+  all_pair_tables[[pname]] <- wdf
+}
+
+####################################
+# 4) Now you have 6 tables in all_pair_tables, 
+#    each with 4 rows (the TFBS categories).
+# You can print them or render them as you like:
+####################################
+for (pname in pair_list) {
+  cat("\n### Pair:", pname, "\n")
+  print(knitr::kable(all_pair_tables[[pname]], format="pipe"))
+}
+
+```
+
+
+```{r}
+library(dplyr)
+library(broom)
+library(ggplot2)
+
+# Analysis A: PWD Across All Pairs (Normal vs Cancer)
+
+fit_factor_model4 <- function(df) {
+  # Weighted factor-based approach
+  # rank in levels c("all_w_o_coad","coad_only","coad_plus_others","common_all_8")
+  # We re-level the factor so 'all_w_o_coad' is baseline:
+  df$rank <- relevel(factor(df$rank), ref="all_w_o_coad")
+  
+  # Weighted LM: pwd ~ rank + nCpG, weighting by sum of coverage
+  fit <- lm(pwd ~ rank + nCpG, data=df, weights=(df$da.sum_cov + df$db.sum_cov))
+  
+  # Tidy to get coefficient estimates
+  co <- broom::tidy(fit)
+  # Full covariance matrix
+  vc <- vcov(fit)
+  
+  # Helper to extract estimate and var for "Intercept"
+  get_beta_est <- function(term_name) {
+    idx <- which(co$term == term_name)
+    est <- co$estimate[idx]
+    idx_vc <- rownames(vc) == term_name
+    list(
+      est=est,
+      idx=idx_vc
+    )
+  }
+  
+  # 1) Intercept => baseline for all_w_o_coad
+  b0 <- get_beta_est("(Intercept)")
+  b0_est <- b0$est  # numeric scalar
+  b0_idx <- b0$idx
+  
+  # 2) coad_only => slope from baseline
+  bCoadOnly <- get_beta_est("rankcoad_only")
+  # 3) coad_plus_others => slope from baseline
+  bCoadPlus <- get_beta_est("rankcoad_plus_others")
+  # 4) common_all_8 => slope from baseline
+  bAll8 <- get_beta_est("rankcommon_all_8")
+  
+  # For each category, compute predicted mean & var
+  # baseline ("all_w_o_coad"): just b0_est
+  # var => vc[b0_idx,b0_idx]
+  
+  # define a small function to combine b0 + slope
+  combine_est <- function(b0_idx, slope_idx) {
+    # b0_idx, slope_idx are logical vectors for the vc matrix
+    # if slope_idx is all FALSE => we mean the baseline
+    b0var <- vc[b0_idx, b0_idx, drop=TRUE]
+    if (!any(slope_idx)) {
+      # baseline
+      est_val <- b0_est
+      var_val <- b0var
+    } else {
+      slope_row <- co$term[slope_idx]
+      slope_est <- co$estimate[co$term == slope_row]
+      
+      # combined estimate
+      est_val <- b0_est + slope_est
+      
+      # combined var = var(b0) + var(slope) + 2 Cov(b0, slope)
+      slopevar <- vc[slope_idx, slope_idx, drop=TRUE]
+      cov_val  <- vc[b0_idx, slope_idx, drop=TRUE]
+      
+      var_val <- b0var + slopevar + 2*cov_val
+    }
+    c(est_val, var_val)
+  }
+  
+  # 1) baseline "all_w_o_coad"
+  c1 <- combine_est(b0_idx, rep(FALSE, length(b0_idx)))  # no slope
+  # 2) coad_only
+  c2 <- combine_est(b0_idx, bCoadOnly$idx)
+  # 3) coad_plus_others
+  c3 <- combine_est(b0_idx, bCoadPlus$idx)
+  # 4) common_all_8
+  c4 <- combine_est(b0_idx, bAll8$idx)
+  
+  # c1,c2,... each is c(est, var)
+  # wrap them into a data.frame
+  cat_names <- c("all_w_o_coad","coad_only","coad_plus_others","common_all_8")
+  out_mat <- rbind(c1, c2, c3, c4)
+  
+  data.frame(
+    category = cat_names,
+    yhat     = out_mat[,1],
+    se       = sqrt(out_mat[,2])
+  )
+}
+
+# EXAMPLE USAGE
+results_list <- list()
+for (pname in unique(pairsDt2$pair)) {
+  subdf <- subset(pairsDt2, pair==pname)
+  dres  <- fit_factor_model4(subdf)
+  dres$pair <- pname
+  dres$tissue_type <- if(grepl("JN_vs_IN", pname)) "non-cancer" else "cancer"
+  results_list[[pname]] <- dres
+}
+plotdf <- dplyr::bind_rows(results_list)
+
+# reorder factor
+plotdf$category <- factor(
+  plotdf$category, 
+  levels=c("all_w_o_coad","coad_only","coad_plus_others","common_all_8")
+)
+
+# Plot: one line per pair, x=4 categories, y= predicted means, ± 1.96 * se
+ggplot(plotdf, aes(x=category, y=yhat, color=pair, group=pair, shape=tissue_type)) +
+  geom_line(size=1) +
+  geom_point(size=3) +
+  geom_errorbar(aes(ymin=yhat-1.96*se, ymax=yhat+1.96*se), width=0.2) +
+  labs(
+    title="Per-Pair Weighted Factor Regression Means (Full Cov Matrix)",
+    y="Estimated PWD (±1.96SE)",
+    x="TFBS Category",
+    color="Sample Pair",
+    shape="Pair Type"
+  ) +
+  theme_minimal(base_size=14)
+
+
+```
+
+```{r ForestPlot, fig.height=8, fig.width=9}
+# We can do a simple forest plot using the 'meta' package:
+library(meta)
+
+mtrendb <- metagen(
+  TE = model2_df$trend_b1,
+  seTE = model2_df$se_trend_b1,
+  data=model2_df,
+  studlab=model2_df$samplepair,
+  subgroup=model2_df$tissue_type,  # optional
+  sm="MD", common=TRUE
+)
+forest(mtrendb)
+
+```
+
+```{r}
+pairsDt2$sample_type <- ifelse(grepl("JN_vs_IN", pairsDt2$pair), 
+                               "normal_vs_normal","cancer_vs_cancer")
+
+# Fit a simple linear model
+# ignoring memory concerns for large data:
+lm_model <- lm(pwd ~ rank + nCpG + sample_type, data=pairsDt2)
+summary(lm_model)
+
+# or separate normal/cancer subsets
+pairs_normal <- subset(pairsDt2, sample_type=="normal_vs_normal")
+pairs_cancer <- subset(pairsDt2, sample_type=="cancer_vs_cancer")
+
+lm_norm <- lm(pwd ~ rank + nCpG, data=pairs_normal)
+lm_canc <- lm(pwd ~ rank + nCpG, data=pairs_cancer)
+
+```
+```{r}
+############################################################
+## 1) Restrict to FIMO=TRUE intervals
+############################################################
+fimo_true_df <- pairsDt2 %>% filter(fimo == TRUE)
+
+############################################################
+## 2) Apply the factor-based model to each pair, coverage-weighted
+############################################################
+# We'll store results in a new list so we don't overwrite your previous 'plotdf'
+results_list_fimo <- list()
+
+for (pname in unique(fimo_true_df$pair)) {
+  subdf <- subset(fimo_true_df, pair == pname)
+  
+  # If a pair has no intervals with FIMO=TRUE, skip
+  if (nrow(subdf) == 0) next
+  
+  # Reuse your 'fit_factor_model4' function
+  dres <- fit_factor_model4(subdf)
+  
+  dres$pair <- pname
+  dres$tissue_type <- if(grepl("JN_vs_IN", pname)) "non-cancer" else "cancer"
+  results_list_fimo[[pname]] <- dres
+}
+
+# Combine each pair’s results into one data frame
+plotdf_fimo <- dplyr::bind_rows(results_list_fimo)
+
+############################################################
+## 3) Re-order the factor for the 4 TFBS categories (optional)
+############################################################
+plotdf_fimo$category <- factor(
+  plotdf_fimo$category,
+  levels = c("all_w_o_coad","coad_only","coad_plus_others","common_all_8")
+)
+
+############################################################
+## 4) Plot the lines ± SE, just like your existing figure
+############################################################
+library(ggplot2)
+
+ggplot(plotdf_fimo, aes(x=category, y=yhat, color=pair, group=pair, shape=tissue_type)) +
+  geom_line(size=1) +
+  geom_point(size=3) +
+  geom_errorbar(aes(ymin = yhat - 1.96*se, ymax = yhat + 1.96*se), width=0.2) +
+  labs(
+    title = "Per-Pair Weighted Factor Regression Means (FIMO=TRUE Only)",
+    y = "Estimated PWD (± 1.96 SE)",
+    x = "TFBS Category",
+    color = "Sample Pair",
+    shape = "Pair Type"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+```{r, ForestPlot, fig.width=9,warning=FALSE}
+pan_df <- pairsDt2 %>%
+  filter(rank == "common_all_8")  # i.e. "pan-cancer"
+
+# Possibly coverage weighting if you want:
+# define weight = da.sum_cov + db.sum_cov, then do weighted.mean(pwd, weight)
+summ_pan <- pan_df %>%
+  group_by(pair) %>%
+  summarize(
+    avg_pwd = mean(pwd, na.rm=TRUE),
+    se_pwd  = sd(pwd, na.rm=TRUE)/sqrt(n()),  # crude standard error of the mean
+    .groups="drop"
+  )
+# Suppose we treat each pair’s average PWD as "effect size"
+# and se_pwd as the standard error. This is somewhat naive 
+# but reveals whether “cancer” pairs are lower or higher than “normal”.
+library(meta)
+
+# Mark “normal” or “cancer”
+summ_pan$sample_type <- ifelse(grepl("JN_vs_IN", summ_pan$pair), "normal","cancer")
+
+# We do a meta analysis:
+m <- metagen(
+  TE   = summ_pan$avg_pwd,
+  seTE = summ_pan$se_pwd,
+  data = summ_pan,
+  studlab = summ_pan$pair,
+  subgroup = summ_pan$sample_type,
+  fixed=TRUE, random=FALSE,  # fixed-effect to keep it simple
+  sm="MD"
+)
+
+forest(m,
+  sortvar=TE,  # or no sorting
+  subgroup=TRUE,
+  digits=3,
+  lab.e="Higher PWD"
+)
+
+```
+
+
+
+```{r}
+# Model with interaction 
+lm_fimo <- lm(pwd ~ rank * fimo + nCpG + sample_type, data=pairsDt2)
+summary(lm_fimo)
+
+```
+
+```{r}
+
+pairsDt2 <- pairsDt2 %>%
+  mutate(
+    nCpG_bin = case_when(
+      nCpG <= 3 ~ as.character(nCpG),
+      TRUE      ~ "4+"
+    ),
+    nCpG_bin = factor(nCpG_bin, levels=c("1","2","3","4+")),
+    
+    # coverage weight
+    weight = da.sum_cov + db.sum_cov
+  )
+
+# Weighted average of PWD by {sample_type, nCpG_bin, fimo}
+summ_dt <- pairsDt2 %>%
+  group_by(sample_type, nCpG_bin, fimo) %>%
+  summarize(
+    mean_pwd = weighted.mean(pwd, weight, na.rm=TRUE),
+    .groups = "drop"
+  )
+
+library(ggplot2)
+
+ggplot(summ_dt, aes(
+  x = nCpG_bin,
+  y = mean_pwd,
+  group = sample_type,
+  color = sample_type
+)) +
+  geom_line(size=1) +
+  geom_point(size=2) +
+  facet_wrap(~ fimo, ncol=2, 
+             labeller = labeller(
+               fimo = c(`FALSE`="FIMO = FALSE", `TRUE`="FIMO = TRUE")
+             )) +
+  labs(
+    title = "Mean PWD by nCpG Bin",
+    subtitle = "Faceted by FIMO overlap (columns) with coverage-weighted cancer average",
+    x = "# CpGs in Interval",
+    y = "Weighted Mean PWD",
+    color = "Sample Type"
+  ) +
+  coord_cartesian(ylim=c(0,0.15)) +  # e.g. limit at 0.15
+  theme_minimal(base_size=14) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(face="bold")
+  )
+
+```
+```{r, fig.height=10,fig.width=15}
+pairsDt2 <- pairsDt2 %>%
+  mutate(
+    # Only 4 bins: 1,2,3,4+
+    nCpG_bin = case_when(
+      nCpG <= 1 ~ "1",
+      nCpG <= 2 ~ "2",
+      nCpG <= 3 ~ "3",
+      TRUE      ~ "4+"           # everything >=4 in '4+'
+    ),
+    # Ensure ordering: 1 < 2 < 3 < 4+
+    nCpG_bin = factor(nCpG_bin, levels=c("1","2","3","4+"))
+  )
+
+lm_fit <- lm(
+  pwd ~ rank * fimo + nCpG_bin + sample_type,
+  data = pairsDt2
+)
+summary(lm_fit)
+
+# 1) Expand the grid
+all_ranks <- levels(pairsDt2$rank)  # the 4 categories
+all_fimo  <- c(FALSE,TRUE)
+all_ncpG  <- levels(pairsDt2$nCpG_bin) # now 4 bins
+all_stype <- c("normal_vs_normal","cancer_vs_cancer")
+
+pred_grid <- expand.grid(
+  rank        = all_ranks,
+  fimo        = all_fimo,
+  nCpG_bin    = all_ncpG,
+  sample_type = all_stype,
+  KEEP.OUT.ATTRS=FALSE
+)
+
+pred_grid$pwd_hat <- predict(lm_fit, newdata=pred_grid)
+
+pred_normal <- subset(pred_grid, sample_type=="normal_vs_normal")
+pred_cancer <- subset(pred_grid, sample_type=="cancer_vs_cancer")
+```
+
+```{r}
+# Example: refined color, rename the factor levels, etc.
+
+abbrev_labels <- c(
+  "coad_only"        = "Colon-unique",
+  "coad_plus_others" = "Colon-plus",
+  "common_all_8"     = "Pan-cancer",
+  "all_w_o_coad"     = "Non-colon"
+)
+
+# Make fimo a factor with descriptive labels
+pred_normal$fimo <- factor(pred_normal$fimo, levels=c(FALSE,TRUE),
+                           labels=c("No Overlap","Overlap"))
+pred_cancer$fimo <- factor(pred_cancer$fimo, levels=c(FALSE,TRUE),
+                           labels=c("No Overlap","Overlap"))
+
+# Also re-factor rank
+pred_normal$rank <- factor(pred_normal$rank, 
+  levels=c("all_w_o_coad","coad_only","coad_plus_others","common_all_8"))
+pred_cancer$rank <- factor(pred_cancer$rank, 
+  levels=c("all_w_o_coad","coad_only","coad_plus_others","common_all_8"))
+
+# Normal
+p_normal <- ggplot(pred_normal, aes(x=rank, y=pwd_hat, group=fimo, color=fimo)) +
+  geom_line(size=1) +
+  geom_point(size=2) +
+  facet_wrap(~ nCpG_bin, nrow=1) +
+  scale_x_discrete(labels=abbrev_labels) +
+  coord_cartesian(ylim=c(0,0.13)) +  # adapt as needed
+  labs(
+    title    = "Predicted PWD (Adjusted) – Normal vs Normal",
+    subtitle = "TFBS group × FIMO overlap, across nCpG bins",
+    x        = "TFBS Category",
+    y        = "Model-predicted PWD",
+    color    = "FIMO Overlap"
+  ) +
+  theme_minimal(base_size=14) +
+  theme(
+    legend.position="top",
+    strip.text=element_text(face="bold", size=14),
+    axis.text.x=element_text(size=12, angle=30, hjust=1) # tilt x labels if needed
+  )
+
+# Cancer
+p_cancer <- ggplot(pred_cancer, aes(x=rank, y=pwd_hat, group=fimo, color=fimo)) +
+  geom_line(size=1) +
+  geom_point(size=2) +
+  facet_wrap(~ nCpG_bin, nrow=1) +
+  scale_x_discrete(labels=abbrev_labels) +
+  coord_cartesian(ylim=c(0,0.13)) +
+  labs(
+    title    = "Predicted PWD (Adjusted) – Cancer vs Cancer",
+    subtitle = "TFBS group × FIMO overlap, across nCpG bins",
+    x        = "TFBS Category",
+    y        = "Model-predicted PWD",
+    color    = "FIMO Overlap"
+  ) +
+  theme_minimal(base_size=14) +
+  theme(
+    legend.position="top",
+    strip.text=element_text(face="bold", size=14),
+    axis.text.x=element_text(size=12, angle=30, hjust=1)
+  )
+
+p_normal
+p_cancer
+
+```
+
+
+
