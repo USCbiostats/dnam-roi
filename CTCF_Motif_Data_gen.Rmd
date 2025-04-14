@@ -1,0 +1,480 @@
+---
+title: "CTCF_Motif_Data_generation"
+output: html_document
+date: "2025-04-14"
+---
+
+
+```{r libraries, message=FALSE,warning=FALSE}
+
+library(data.table)
+library(Biostrings)
+library(ComplexHeatmap)
+library(ggplot2)
+library(knitr)
+library(tidyr)
+library(broom)
+library(kableExtra)
+library(dplyr)
+library(GenomeInfoDb)
+library(rtracklayer)
+library(GenomicRanges)
+library(S4Vectors)
+```
+
+
+```{r}
+# List of cancer types in order
+cancer_list <- c("COAD", "BLCA", "BRCA", "GBM", "KIRC", "KIRP", "LUAD", "SKCM")
+
+# Initialize a list to store the merged CTCF intervals for each cancer
+ctcf_merged_list <- list()
+
+# Step 1: Import and Process Motif Data for Each Cancer
+for (cancer in cancer_list) {
+  # Construct the file path
+  file_path <- paste0("data/", cancer, "_cleaned_motifs.csv")
+  
+  # Read the motif data
+  motif_data <- fread(file_path, header = TRUE)
+  
+  # Ensure column names are correct
+  if (!all(c("seqnames", "start", "end", "group_name") %in% colnames(motif_data))) {
+    colnames(motif_data) <- c("seqnames", "start", "end", "group_name")
+  }
+  
+  # Filter to keep only CTCF group
+  ctcf_data <- motif_data %>%
+    filter(group_name == "CTCF")
+  
+  # Check if any data is present
+  if (nrow(ctcf_data) == 0) {
+    message("No CTCF motifs found in ", cancer)
+    ctcf_merged_list[[cancer]] <- GRanges()  # Store an empty GRanges object
+    next
+  }
+  
+  # Adjust motif start positions for 1-based coordinates if necessary
+  # Uncomment the following line if your data is 0-based
+  # ctcf_data$start <- ctcf_data$start + 1  # Convert start to 1-based coordinates
+  
+  # Create GRanges object for CTCF motifs
+  ctcf_gr <- GRanges(
+    seqnames = ctcf_data$seqnames,
+    ranges = IRanges(start = ctcf_data$start, end = ctcf_data$end)
+  )
+  
+  # Ensure consistent chromosome naming
+  seqlevelsStyle(ctcf_gr) <- "UCSC"
+  
+  # Merge overlapping intervals
+  ctcf_gr_merged <-  GenomicRanges::reduce(ctcf_gr)
+  
+  # Store the merged intervals in the list
+  ctcf_merged_list[[cancer]] <- ctcf_gr_merged
+}
+```
+
+
+```{r}
+############################################
+## 1) Setup
+############################################
+
+# We assume you have:
+#   cancer_list <- c("COAD","BLCA","BRCA","GBM","KIRC","KIRP","LUAD","SKCM")
+#   ctcf_merged_list: a named list of GRanges for each cancer
+
+coad <- ctcf_merged_list[["COAD"]]
+others_list <- ctcf_merged_list[ setdiff(cancer_list, "COAD") ]
+
+############################################
+## 2) Count Overlaps for Each COAD Interval in a Single Pass
+############################################
+
+# We want to see how many of the 7 "others" each COAD interval partially overlaps.
+# We'll keep an integer vector overlap_counts, size = length(coad),
+# then for each "other" GRanges, we findOverlaps(coad, that other),
+# and increment overlap_counts for all intervals that matched.
+
+overlap_counts <- integer(length(coad))  # track how many other-cancers each COAD interval hits
+
+for (nm in names(others_list)) {
+  other_gr <- others_list[[nm]]
+  ov <- findOverlaps(coad, other_gr)
+  # queryHits(ov) are the indices in coad that overlap 'other_gr'
+  overlap_counts[unique(queryHits(ov))] <- overlap_counts[unique(queryHits(ov))] + 1
+}
+
+############################################
+## 3) Classify Each COAD Interval
+############################################
+
+# We define:
+#   if overlap_count == 0 -> "coad_only"
+#   if overlap_count == 7 -> "common_all_8"
+#   else -> "coad_plus_others"
+
+n_coad <- length(coad)
+category_of <- character(n_coad)
+
+for (i in seq_len(n_coad)) {
+  oc <- overlap_counts[i]
+  if (oc == 0) {
+    category_of[i] <- "coad_only"
+  } else if (oc == 7) {
+    category_of[i] <- "common_all_8"
+  } else {
+    category_of[i] <- "coad_plus_others"
+  }
+}
+
+coad_only        <- coad[category_of=="coad_only"]
+common_all_8     <- coad[category_of=="common_all_8"]
+coad_plus_others <- coad[category_of=="coad_plus_others"]
+
+cat("coad_only:        ", length(coad_only), "\n")
+cat("common_all_8:     ", length(common_all_8), "\n")
+cat("coad_plus_others: ", length(coad_plus_others), "\n")
+cat("Sum check vs coad:", length(coad_only) + length(common_all_8) + length(coad_plus_others),
+    " / ", length(coad), "\n\n")
+
+############################################
+## 4) Construct all_w_o_coad
+############################################
+## We gather the intervals from the other 7 sets
+## then remove any that partially overlap COAD
+
+# (A) Combine 'others' into one big set. 
+
+# 1) Start with the first GRanges
+others_merged <- others_list[[1]]
+
+# 2) Combine each subsequent GRanges one by one
+for (k in seq(2, length(others_list))) {
+  others_merged <- c(others_merged, others_list[[k]])  
+  # This ensures the S4 method c,GRanges,GRanges is called, producing a GRanges
+}
+
+# 3) Then call 'reduce'
+all_others_reduced <-  GenomicRanges::reduce(others_merged)
+
+filter_out_overlap <- function(x, y) {
+  if (length(x) == 0) return(x)
+  ov <- findOverlaps(x, y)
+  remove_idx <- unique(queryHits(ov))
+  if (length(remove_idx) == 0) {
+    return(x)
+  }
+  keep_idx <- setdiff(seq_along(x), remove_idx)
+  x[keep_idx]
+}
+
+all_w_o_coad <- filter_out_overlap(all_others_reduced, coad)
+cat("all_w_o_coad intervals:", length(all_w_o_coad), "\n")
+
+
+# Now we have 4 disjoint sets: 
+#    common_all_8_overlap, coad_plus_others_overlap, coad_only_overlap, all_w_o_coad_overlap
+
+############################################
+## 2. Prepare the 4 Groups in a Named List
+############################################
+ctcf_4groups <- list(
+  "common_all_8"    = common_all_8,
+  "coad_plus_others" = coad_plus_others,
+  "coad_only"       = coad_only,
+  "all_w_o_coad"    = all_w_o_coad
+)
+
+
+```
+
+```{r}
+c(
+  common_all_8 = length(common_all_8),
+  coad_plus_others = length(coad_plus_others),
+  coad_only = length(coad_only),
+  all_w_o_coad = length(all_w_o_coad)
+)
+
+length(GenomicRanges::intersect(common_all_8, coad_only))      # 0 if disjoint
+length(GenomicRanges::intersect(common_all_8, all_w_o_coad))   # 0
+length(GenomicRanges::intersect(coad_plus_others, coad_only))  # 0
+# etc...
+
+partial_union <- c(common_all_8,
+                   coad_plus_others,
+                   coad_only,
+                   all_w_o_coad)
+
+total_partial_intervals <- length(partial_union)
+total_length <- length(all_w_o_coad)+length(common_all_8)+length(coad_only)+length(coad_plus_others)
+cat("Sum of intervals across the 4 partial-overlap groups:", total_partial_intervals, "\n")
+cat("Sum of length for 4 partial-overlap groups:", total_length, "\n")
+```
+
+
+```{r}
+# CTCF-all motifs (FIMO)
+CTCF_hg38_all <- import("data/ENCFF356LFX.bed.gz")
+CTCF_hg38_reduce =  GenomicRanges::reduce(CTCF_hg38_all)
+CTCF_hg38_reduce
+```
+
+```{r}
+coad_only$ctcf_idx <- paste0("coad_only_", seq_along(coad_only))
+common_all_8$ctcf_idx <- paste0("common_all_8_", seq_along(common_all_8))
+coad_plus_others$ctcf_idx <- paste0("coad_plus_others_", seq_along(coad_plus_others))
+all_w_o_coad$ctcf_idx <- paste0("all_w_o_coad_", seq_along(all_w_o_coad))
+
+```
+
+
+```{r}
+
+# 1) We have 3 normal samples: JN, IN,EN
+#    5 cancer pairs: (JA, JB), (IA, IB), (DA, DB), (HA, HB), (MA, MB)
+# => total 13 bed files
+
+all_samples <- c("JN","IN","EN","JA","JB","IA","IB","DA","DB","HA","HB","MA","MB")
+
+meth_gr_list <- list()
+for (smp in all_samples) {
+  bed_file <- file.path("data", paste0(smp, ".bed"))
+  cat("Reading", bed_file, "...\n")
+  
+  # Read the .bed
+  df <- fread(bed_file, header = FALSE)
+  # columns: chrom, start, end, beta, coverage, methylated, unmethylated
+  colnames(df) <- c("chrom","start","end","beta","coverage","methylated","unmethylated")
+  
+  # Convert to GRanges
+  gr <- GRanges(
+    seqnames = df$chrom,
+    ranges   = IRanges(start=df$start, end=df$end),
+    strand   = "*"
+  )
+  mcols(gr)$beta        <- df$beta
+  mcols(gr)$coverage    <- df$coverage
+  mcols(gr)$methylated  <- df$methylated
+  mcols(gr)$unmethylated<- df$unmethylated
+  
+  seqlevelsStyle(gr) <- "UCSC"  # unify naming
+  
+  meth_gr_list[[smp]] <- gr
+}
+
+cat("Done reading all samples.\n")
+
+```
+```{r}
+# B) Four TFBS Groups
+
+coad_only$ctcf_idx        <- paste0("coad_only_", seq_along(coad_only))
+common_all_8$ctcf_idx     <- paste0("common_all_8_", seq_along(common_all_8))
+coad_plus_others$ctcf_idx <- paste0("coad_plus_others_", seq_along(coad_plus_others))
+all_w_o_coad$ctcf_idx     <- paste0("all_w_o_coad_", seq_along(all_w_o_coad))
+
+tfbs_groups_list <- list(
+  "coad_only"        = coad_only,
+  "common_all_8"     = common_all_8,
+  "coad_plus_others" = coad_plus_others,
+  "all_w_o_coad"     = all_w_o_coad
+)
+```
+
+
+```{r}
+# C) Summarizing Methylation & Computing PWD for Each Pair
+# Define a function to handle the summarization for one sample and one TFBS group:
+
+summarize_meth_for_group <- function(gr_group, meth_gr) {
+  if (length(gr_group) == 0) return(data.table())
+  
+  ov <- findOverlaps(gr_group, meth_gr)
+  if (length(ov)==0) return(data.table())
+  
+  grp_idx  <- queryHits(ov)   # index into gr_group
+  meth_idx <- subjectHits(ov) # index into meth_gr
+  
+  dt <- as.data.table(mcols(meth_gr[meth_idx]))
+  dt$ctcf_idx <- mcols(gr_group)$ctcf_idx[grp_idx]  # carry the interval's ID
+  
+  # Summarize coverage across that entire interval
+  sum_dt <- dt[, .(
+    nCpG        = .N,
+    sum_methyl  = sum(methylated),
+    sum_cov     = sum(coverage)
+  ), by=ctcf_idx]
+  
+  sum_dt$poolbeta <- sum_dt$sum_methyl / sum_dt$sum_cov
+  sum_dt
+}
+
+compute_pwd_for_pair <- function(
+  sampleA, sampleB,
+  tfbs_groups_list,
+  meth_gr_list
+) {
+  # We'll produce one data.table with columns:
+  #   ctcf_idx, group_name, da.nCpG, db.nCpG, nCpG, da.sum_cov, db.sum_cov, da.poolbeta, db.poolbeta, pwd
+  # plus a "pair" column for labeling.
+  
+  res_list <- list()
+  
+  for (grp_nm in names(tfbs_groups_list)) {
+    gr_group <- tfbs_groups_list[[grp_nm]]
+    
+    dtA <- summarize_meth_for_group(gr_group, meth_gr_list[[sampleA]])
+    dtB <- summarize_meth_for_group(gr_group, meth_gr_list[[sampleB]])
+    
+    # rename columns to keep them distinct
+    colnames(dtA) <- c("ctcf_idx","da.nCpG","da.sum_meth","da.sum_cov","da.poolbeta")
+    colnames(dtB) <- c("ctcf_idx","db.nCpG","db.sum_meth","db.sum_cov","db.poolbeta")
+    
+    # Merge by ctcf_idx only, not by nCpG
+    merged_dt <- merge(dtA, dtB, by="ctcf_idx", all=FALSE)
+    
+    # define nCpG = max( da.nCpG, db.nCpG )
+    merged_dt$nCpG <- pmax(merged_dt$da.nCpG, merged_dt$db.nCpG)
+    
+    # compute pwd
+    merged_dt$pwd <- abs(merged_dt$da.poolbeta - merged_dt$db.poolbeta)
+    
+    # store group
+    merged_dt$group_name <- grp_nm
+    
+    res_list[[grp_nm]] <- merged_dt
+  }
+  
+  out_dt <- data.table::rbindlist(res_list, fill=TRUE)
+  out_dt$pair <- paste0(sampleA,"_vs_",sampleB)
+  out_dt
+}
+```
+
+
+```{r}
+############################################################
+## 1) Define the sample pairs
+############################################################
+# 5 cancer pairs remain
+cancer_pairs <- list(
+  c("JA","JB"),
+  c("IA","IB"),
+  c("DA","DB"),
+  c("HA","HB"),
+  c("MA","MB")
+)
+
+# Now define 3 normal pairs:
+normal_pairs <- list(
+  c("JN","IN"),
+  c("JN","EN"),
+  c("IN","EN")
+)
+
+############################################################
+## 2) Combine them in a single list if you like
+############################################################
+all_pairs <- c(normal_pairs, cancer_pairs)
+
+############################################################
+## 3) Prepare an empty data.table to store all results
+############################################################
+pairsDt <- data.table()
+
+############################################################
+## 4) Loop over each pair, compute PWD, filter coverage≥5
+############################################################
+for (pair_vec in all_pairs) {
+  A <- pair_vec[[1]]
+  B <- pair_vec[[2]]
+  cat("\nComputing PWD for pair:", A, "vs", B, "...\n")
+  
+  # Call your function that merges intervals, etc.
+  res <- compute_pwd_for_pair(A, B, tfbs_groups_list, meth_gr_list)
+  
+  # Now filter coverage≥5 in *both* samples
+  # i.e. (da.sum_cov>4 & db.sum_cov>4)
+  res <- res[ da.sum_cov>4 & db.sum_cov>4 ]
+  
+  # rbind to the main data table
+  pairsDt <- rbind(pairsDt, res, fill=TRUE)
+}
+
+cat("\nFinal pairsDt has", nrow(pairsDt), "rows after coverage≥5 filtering.\n")
+
+```
+
+
+```{r}
+# Suppose we have a GRanges CTCF_hg38_reduce for the FIMO sites
+# We'll create a map of which ctcf_idx overlap FIMO, per group. 
+# Alternatively, you can do an approach that merges them in each group.
+
+fimo_boolean <- function(gr_group, fimo_gr) {
+  hits <- findOverlaps(gr_group, fimo_gr)
+  overlap_idx <- unique(queryHits(hits))
+  fimo_vec <- rep(FALSE, length(gr_group))
+  fimo_vec[overlap_idx] <- TRUE
+  fimo_vec
+}
+
+# Build a dictionary: for each group, for each ctcf_idx, isFimo?
+fimo_map <- list()
+for (grp_nm in names(tfbs_groups_list)) {
+  gr_g <- tfbs_groups_list[[grp_nm]]
+  if (length(gr_g)>0) {
+    fimo_vec <- fimo_boolean(gr_g, CTCF_hg38_reduce)
+    fimo_map[[grp_nm]] <- data.frame(
+      ctcf_idx = mcols(gr_g)$ctcf_idx,
+      fimo     = fimo_vec,
+      stringsAsFactors=FALSE
+    )
+  } else {
+    fimo_map[[grp_nm]] <- data.frame(
+      ctcf_idx=character(0), fimo=logical(0)
+    )
+  }
+}
+
+# Convert each to a single big map
+fimo_map_dt <- data.table::rbindlist(
+  lapply(names(fimo_map), function(nm) {
+    df <- fimo_map[[nm]]
+    df$group_name <- nm
+    df
+  }),
+  fill=TRUE
+)
+
+# Now merge pairsDt with fimo_map_dt by (ctcf_idx, group_name)
+pairsDt2 <- merge(
+  pairsDt,
+  fimo_map_dt,
+  by=c("ctcf_idx","group_name"),
+  all.x=TRUE
+)
+pairsDt2$fimo[is.na(pairsDt2$fimo)] <- FALSE  # intervals not in the map -> no FIMO
+pairsDt2$fimo <- as.logical(pairsDt2$fimo)
+
+```
+
+```{r}
+pairsDt2 <- pairsDt2 %>%
+  mutate(
+    # rename 'group_name' -> 'rank' or something
+    rank = factor(group_name, 
+                  levels=c("all_w_o_coad","coad_only","coad_plus_others","common_all_8")),
+    # maybe define a numeric rank or keep it factor
+    nCpG_factor = ifelse(nCpG > 3, "4+", as.character(nCpG))
+  )
+
+```
+
+```{r}
+write.csv(pairsDt2, "data/pwd_pairsDT2.csv", row.names = FALSE)
+```
+
