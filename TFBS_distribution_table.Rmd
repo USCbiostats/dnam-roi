@@ -1,0 +1,103 @@
+---
+title: "CTCF_tfbs_distribution_table"
+output: html_document
+date: "2025-04-16"
+---
+
+```{r libraries, message=FALSE,warning=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(data.table)
+```
+
+```{r}
+pairsDt2 <- read_csv("data/pwd_pairsDT2.csv")
+```
+
+```{r}
+############################################
+## TFBS‑interval summary script
+##
+##  – Works for each sample‑pair **and** for the
+##    entire data‑set in one run.
+##  – No PWD filtering: PWD = 0 is kept.
+##  – Prints the key counts & %’s you need to
+##    copy‑paste (or optionally builds a ready‑made
+##    table with knitr::kable).
+############################################
+
+
+tfbs_lv  <- c("all_w_o_coad","coad_only","coad_plus_others","common_all_8")
+pretty   <- c(all_w_o_coad="Non‑colon", coad_only="Colon‑unique",
+              coad_plus_others="Colon‑plus", common_all_8="Pan‑cancer")
+
+##############################################################################
+## 1)  helper that does *one* data‑set (a pair)  ------------------------------
+##############################################################################
+make_pair_table <- function(df, label){
+
+  raw <- df |>
+         mutate(cat = pretty[group_name]) |>
+         count(cat, fimo, name = "N") |>
+         mutate(fimo = ifelse(fimo, "FIMO", "NoFIMO")) |>
+         pivot_wider(names_from = fimo,
+                     values_from = N,
+                     values_fill = 0) |>
+         mutate(Total = FIMO + NoFIMO)
+
+  ## build the five rows -----------------------------------------------------
+  row_nc   <- filter(raw, cat == "Non‑colon")
+  row_sub  <- filter(raw, cat != "Non‑colon")                 # 3 sub rows
+  row_coad <- summarise(row_sub, cat="COAD",
+                        FIMO=sum(FIMO), NoFIMO=sum(NoFIMO), Total=sum(Total))
+
+  tbl <- bind_rows(row_nc, row_coad, row_sub)
+
+  ## overall denominators  ---------------------------------------------------
+  nc_tot      <- row_nc$Total
+  coad_tot    <- row_coad$Total
+  tot_all     <- nc_tot + coad_tot
+
+  nc_fimo     <- row_nc$FIMO;  coad_fimo  <- row_coad$FIMO
+  tot_fimo    <- nc_fimo + coad_fimo
+
+  nc_nofimo   <- row_nc$NoFIMO; coad_nof  <- row_coad$NoFIMO
+  tot_nofimo  <- nc_nofimo + coad_nof
+
+  ## percentages -------------------------------------------------------------
+  tbl <- tbl |>
+    mutate(
+      `% Total`  = round(100*Total /
+                         ifelse(cat=="Non‑colon", tot_all,
+                                ifelse(cat=="COAD", tot_all, coad_tot)), 2),
+      `% FIMO`   = round(100*FIMO  /
+                         ifelse(cat=="Non‑colon", tot_fimo,
+                                ifelse(cat=="COAD", tot_fimo, coad_fimo)), 2),
+      `% NoFIMO` = round(100*NoFIMO/
+                         ifelse(cat=="Non‑colon", tot_nofimo,
+                                ifelse(cat=="COAD", tot_nofimo, coad_nof)), 2)
+    )
+
+  ## sanity check ------------------------------------------------------------
+  stopifnot(all.equal(tbl$Total, tbl$FIMO + tbl$NoFIMO))
+
+  cat("\n==============================\nPAIR:", label,
+      "\nTotals  (all / FIMO / NoFIMO) =",
+      tot_all, "/", tot_fimo, "/", tot_nofimo, "\n")
+  print(tbl, row.names = FALSE)
+  invisible(tbl)
+}
+
+
+##############################################################################
+## 2)  run for every pair in `pairsDt2`
+##############################################################################
+
+for (p in sort(unique(pairsDt2$pair))){
+  make_pair_table(filter(pairsDt2, pair == p), p)
+}
+
+
+```
+

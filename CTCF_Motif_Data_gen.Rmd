@@ -216,10 +216,22 @@ cat("Sum of length for 4 partial-overlap groups:", total_length, "\n")
 
 
 ```{r}
+# obtain the FIMO-intervals
+suppressMessages(library(AnnotationHub))
+ah <- AnnotationHub()
+query_data <- subset(ah, preparerclass == "CTCF")
+
+# Explore the AnnotationHub object
+query_data
+query_data$dataprovider %>% table()
+
+subset(query_data, species == "Homo sapiens" &
+                   genome == "hg38" &
+                   dataprovider == "JASPAR 2022")
+
 # CTCF-all motifs (FIMO)
-CTCF_hg38_all <- import("data/ENCFF356LFX.bed.gz")
+CTCF_hg38_all <- query_data[["AH104727"]]
 CTCF_hg38_reduce =  GenomicRanges::reduce(CTCF_hg38_all)
-CTCF_hg38_reduce
 ```
 
 ```{r}
@@ -227,47 +239,67 @@ coad_only$ctcf_idx <- paste0("coad_only_", seq_along(coad_only))
 common_all_8$ctcf_idx <- paste0("common_all_8_", seq_along(common_all_8))
 coad_plus_others$ctcf_idx <- paste0("coad_plus_others_", seq_along(coad_plus_others))
 all_w_o_coad$ctcf_idx <- paste0("all_w_o_coad_", seq_along(all_w_o_coad))
-
 ```
 
 
 ```{r}
+#############################################################
+# 1) Define file paths and samples
+#############################################################
+data_dir <- "data"  # Directory containing the WGBS .bed files
+samples <- c("DA", "DB", "IA", "IB", "HA", "HB", "JA", "JB", "MA", "MB","JN","IN","EN")
 
-# 1) We have 3 normal samples: JN, IN,EN
-#    5 cancer pairs: (JA, JB), (IA, IB), (DA, DB), (HA, HB), (MA, MB)
-# => total 13 bed files
+# The exclusion list file (gzipped BED)
+exclusionlist_file <- file.path(data_dir, "ENCFF356LFX.bed.gz")
 
-all_samples <- c("JN","IN","EN","JA","JB","IA","IB","DA","DB","HA","HB","MA","MB")
+#############################################################
+# 2) Read the blacklist as a GRanges
+#############################################################
+exclusionlist_gr <- import(exclusionlist_file, format = "BED")
+seqlevelsStyle(exclusionlist_gr) <- "UCSC"  
 
-meth_gr_list <- list()
-for (smp in all_samples) {
-  bed_file <- file.path("data", paste0(smp, ".bed"))
-  cat("Reading", bed_file, "...\n")
-  
-  # Read the .bed
-  df <- fread(bed_file, header = FALSE)
-  # columns: chrom, start, end, beta, coverage, methylated, unmethylated
-  colnames(df) <- c("chrom","start","end","beta","coverage","methylated","unmethylated")
-  
-  # Convert to GRanges
-  gr <- GRanges(
-    seqnames = df$chrom,
-    ranges   = IRanges(start=df$start, end=df$end),
-    strand   = "*"
+#############################################################
+# 3) Define a function to read and filter a WGBS bed file
+#############################################################
+read_and_filter_wgbs <- function(bed_file, exclusionlist_gr) {
+  # bed_file: path to the .bed file
+  # exclusionlist_gr: GRanges for the exclusion list
+
+  # Read the .bed file
+  meth_data <- fread(bed_file, header = FALSE)
+  # Assume columns: chrom, start, end, beta, coverage, methylated, unmethylated
+  colnames(meth_data) <- c("chrom", "start", "end", "beta", "coverage", "methylated", "unmethylated")
+
+  # Create GRanges
+  meth_gr <- GRanges(
+    seqnames = meth_data$chrom,
+    ranges = IRanges(start = meth_data$start, end = meth_data$end),
+    beta = meth_data$beta,
+    coverage = meth_data$coverage,
+    methylated = meth_data$methylated,
+    unmethylated = meth_data$unmethylated
   )
-  mcols(gr)$beta        <- df$beta
-  mcols(gr)$coverage    <- df$coverage
-  mcols(gr)$methylated  <- df$methylated
-  mcols(gr)$unmethylated<- df$unmethylated
-  
-  seqlevelsStyle(gr) <- "UCSC"  # unify naming
-  
-  meth_gr_list[[smp]] <- gr
+  seqlevelsStyle(meth_gr) <- "UCSC"
+
+  # Subset to exclude blacklist overlaps
+  # 'invert=TRUE' keeps regions NOT overlapping with the blacklist
+  filtered_gr <- subsetByOverlaps(meth_gr, exclusionlist_gr, invert = TRUE)
+
+  return(filtered_gr)
 }
 
-cat("Done reading all samples.\n")
+meth_gr_list <- list()
+for (smp in samples) {
+  bed_file <- file.path(data_dir, paste0(smp, ".bed"))
+  cat("‑‑ Reading & filtering:", bed_file, " …\n")
+  filtered_gr <- read_and_filter_wgbs(bed_file, exclusionlist_gr)
+  meth_gr_list[[smp]] <- filtered_gr
+}
 
+cat("Done.  Stored", length(meth_gr_list), "GRanges objects in `meth_gr_list`.\n")
 ```
+
+
 ```{r}
 # B) Four TFBS Groups
 
@@ -476,5 +508,69 @@ pairsDt2 <- pairsDt2 %>%
 
 ```{r}
 write.csv(pairsDt2, "data/pwd_pairsDT2.csv", row.names = FALSE)
+```
+
+```{r}
+##############################################################################
+## 1) put the four GRanges into a list
+##############################################################################
+cat_gr <- list(
+  "Non‑colon"   = all_w_o_coad,
+  "Colon‑unique"= coad_only,
+  "Colon‑plus"  = coad_plus_others,
+  "Pan‑cancer"  = common_all_8
+)
+
+##############################################################################
+## 2) get raw counts
+##############################################################################
+raw_ctcf <- lapply(names(cat_gr), function(nm){
+             gr <- cat_gr[[nm]]
+             hit <- findOverlaps(gr, CTCF_hg38_reduce)
+             nf  <- length(unique(queryHits(hit)))
+             nt  <- length(gr)
+             data.frame(cat=nm, FIMO=nf, NoFIMO=nt-nf, Total=nt)
+           }) |>
+           bind_rows()
+
+nc_row   <- filter(raw_ctcf, cat=="Non‑colon")
+sub_rows <- filter(raw_ctcf, cat!="Non‑colon")
+coad_row <- summarise(sub_rows, cat="COAD",
+                      FIMO=sum(FIMO), NoFIMO=sum(NoFIMO), Total=sum(Total))
+
+tbl <- bind_rows(nc_row, coad_row, sub_rows)
+
+## denominators
+nc_tot      <- nc_row$Total
+coad_tot    <- coad_row$Total
+tot_all     <- nc_tot + coad_tot
+
+nc_fimo     <- nc_row$FIMO;  coad_fimo <- coad_row$FIMO
+tot_fimo    <- nc_fimo + coad_fimo
+
+nc_nofimo   <- nc_row$NoFIMO; coad_nf <- coad_row$NoFIMO
+tot_nofimo  <- nc_nofimo + coad_nf
+
+tbl <- tbl |>
+  mutate(
+    `% Total`  = round(100*Total /
+                       ifelse(cat=="Non‑colon", tot_all,
+                              ifelse(cat=="COAD", tot_all, coad_tot)), 2),
+    `% FIMO`   = round(100*FIMO  /
+                       ifelse(cat=="Non‑colon", tot_fimo,
+                              ifelse(cat=="COAD", tot_fimo, coad_fimo)), 2),
+    `% NoFIMO` = round(100*NoFIMO/
+                       ifelse(cat=="Non‑colon", tot_nofimo,
+                              ifelse(cat=="COAD", tot_nofimo, coad_nf)), 2)
+  )
+
+stopifnot(all.equal(tbl$Total, tbl$FIMO + tbl$NoFIMO))
+
+cat("\n==============================\nCTCF catalogue (8 tumour types)",
+    "\nTotals  (all / FIMO / NoFIMO) =",
+    tot_all, "/", tot_fimo, "/", tot_nofimo, "\n")
+print(tbl, row.names = FALSE)
+
+
 ```
 

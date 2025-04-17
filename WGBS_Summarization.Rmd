@@ -14,38 +14,29 @@ library(GenomeInfoDb)
 library(rtracklayer)
 ```
 
-```{r,warning=FALSE,message=FALSE}
-if (!require("BiocManager", quietly = TRUE))
-    install.packages("BiocManager")
-
-BiocManager::install("JASPAR2024", update = FALSE)
-BiocManager::install("AnnotationHub", update = FALSE) 
-BiocManager::install("plyranges", update = FALSE)
-```
-
 
 ```{r}
 #############################################################
 # 1) Define file paths and samples
 #############################################################
 data_dir <- "data"  # Directory containing the WGBS .bed files
-samples <- c("DA", "DB", "IA", "IB", "HA", "HB", "JA", "JB", "MA", "MB","JN","IN")
+samples <- c("DA", "DB", "IA", "IB", "HA", "HB", "JA", "JB", "MA", "MB","JN","IN","EN")
 
-# The blacklist file (gzipped BED)
-blacklist_file <- file.path(data_dir, "hg38-blacklist.v2.bed.gz")
+# The exclusion list file (gzipped BED)
+exclusionlist_file <- file.path(data_dir, "ENCFF356LFX.bed.gz")
 
 #############################################################
 # 2) Read the blacklist as a GRanges
 #############################################################
-blacklist_gr <- import(blacklist_file, format = "BED")
-seqlevelsStyle(blacklist_gr) <- "UCSC"  # Ensure consistent naming, if needed
+exclusionlist_gr <- import(exclusionlist_file, format = "BED")
+seqlevelsStyle(exclusionlist_gr) <- "UCSC"  # Ensure consistent naming, if needed
 
 #############################################################
 # 3) Define a function to read and filter a WGBS bed file
 #############################################################
-read_and_filter_wgbs <- function(bed_file, blacklist_gr) {
+read_and_filter_wgbs <- function(bed_file, exclusionlist_gr) {
   # bed_file: path to the .bed file
-  # blacklist_gr: GRanges for the blacklist
+  # blacklist_gr: GRanges for the exclusionlist
 
   # Read the .bed file
   meth_data <- fread(bed_file, header = FALSE)
@@ -65,7 +56,7 @@ read_and_filter_wgbs <- function(bed_file, blacklist_gr) {
 
   # Subset to exclude blacklist overlaps
   # 'invert=TRUE' keeps regions NOT overlapping with the blacklist
-  filtered_gr <- subsetByOverlaps(meth_gr, blacklist_gr, invert = TRUE)
+  filtered_gr <- subsetByOverlaps(meth_gr, exclusionlist_gr, invert = TRUE)
 
   return(filtered_gr)
 }
@@ -126,7 +117,7 @@ for (smp in samples) {
   bed_file <- file.path(data_dir, paste0(smp, ".bed"))
   
   # 5a) Read & Filter
-  filtered_gr <- read_and_filter_wgbs(bed_file, blacklist_gr)
+  filtered_gr <- read_and_filter_wgbs(bed_file, exclusionlist_gr)
   
   # 5b) Summarize
   summary_dt <- summarize_wgbs(filtered_gr, sample_name = smp)
@@ -143,7 +134,7 @@ final_summary <- rbindlist(all_summaries, fill = TRUE)
 print(final_summary)
 
 # Optionally save to CSV
-# write.csv(final_summary, file = "WGBS_summary_postBlacklist.csv", row.names = FALSE)
+# write.csv(final_summary, file = "WGBS_summary_postexclusionlist.csv", row.names = FALSE)
 
 ```
 
@@ -211,14 +202,15 @@ query_data <- subset(ah, preparerclass == "CTCF")
 query_data
 query_data$dataprovider %>% table()
 
-subset(query_data, species == "Homo sapiens" & 
-                   genome == "hg38" & 
+subset(query_data, species == "Homo sapiens" &
+                   genome == "hg38" &
                    dataprovider == "JASPAR 2022")
 
 # CTCF-all motifs (FIMO)
 CTCF_hg38_all <- query_data[["AH104727"]]
-CTCF_hg38_reduce = GenomicRanges::reduce(CTCF_hg38_all)
+CTCF_hg38_reduce =  GenomicRanges::reduce(CTCF_hg38_all)
 ```
+
 
 ```{r}
 
