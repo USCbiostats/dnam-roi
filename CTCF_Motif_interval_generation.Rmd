@@ -1,0 +1,93 @@
+---
+title: "CTCF Motif interval generation"
+output: html_document
+date: "2025-04-14"
+---
+
+
+```{r libraries, message=FALSE,warning=FALSE}
+library(data.table)
+library(Biostrings)
+library(ggplot2)
+library(knitr)
+library(tidyr)
+library(kableExtra)
+library(dplyr)
+library(GenomeInfoDb)
+library(rtracklayer)
+library(GenomicRanges)
+library(S4Vectors)
+```
+
+
+```{r}
+# List of cancer types in order
+cancer_list <- c("COAD", "BLCA", "BRCA", "GBM", "KIRC", "KIRP", "LUAD", "SKCM")
+
+# Initialize a list to store the merged CTCF intervals for each cancer
+ctcf_list <- list()
+ctcf_gr_unique <- list()
+ctcf_merged_list <- list()
+
+# Step 1: Import and Process Motif Data for Each Cancer
+for (cancer in cancer_list) {
+  # Construct the file path
+  file_path <- paste0(c("~kims/Google Drive/My Drive/Data/hpc-archive/annotations/Cancer_cleaned_Cancer_peakset/"), cancer, "_cleaned_motifs.csv")
+  
+  # Read the motif data
+  motif_data <- fread(file_path, header = TRUE)
+  
+  # Ensure column names are correct
+  if (!all(c("seqnames", "start", "end", "group_name") %in% colnames(motif_data))) {
+    colnames(motif_data) <- c("seqnames", "start", "end", "group_name")
+  }
+  
+  # Filter to keep only CTCF group
+  ctcf_data <- motif_data %>%
+    filter(group_name == "CTCF")
+  
+  # Check if any data is present
+  if (nrow(ctcf_data) == 0) {
+    message("No CTCF motifs found in ", cancer)
+    ctcf_merged_list[[cancer]] <- GRanges()  # Store an empty GRanges object
+    next
+  }
+  
+  # Adjust motif start positions for 1-based coordinates if necessary
+  # Uncomment the following line if your data is 0-based
+  # ctcf_data$start <- ctcf_data$start + 1  # Convert start to 1-based coordinates
+  
+  # Create GRanges object for CTCF motifs
+  ctcf_gr <- GRanges(
+    seqnames = ctcf_data$seqnames,
+    ranges = IRanges(start = ctcf_data$start, end = ctcf_data$end)
+  )
+  
+  # Ensure consistent chromosome naming
+  seqlevelsStyle(ctcf_gr) <- "UCSC"
+  
+  ctcf_list[[cancer]] <- ctcf_gr
+  
+  ctcf_gr_unique[[cancer]] <- as.numeric((table(countOverlaps(ctcf_gr, ctcf_gr))[1]))
+
+  # Merge overlapping intervals
+  ctcf_gr_merged <-  GenomicRanges::reduce(ctcf_gr)
+  
+  # Store the merged intervals in the list
+  ctcf_merged_list[[cancer]] <- ctcf_gr_merged
+}
+```
+
+```{r}
+ca_list <- rbind(unlist(lapply(ctcf_list, length)),
+                  unlist(lapply(ctcf_merged_list, length)))
+
+ca_list <- as.data.frame(t(ca_list))
+colnames(ca_list) <- c("Total_CTCF_int","nonOv_CTCF_int")
+ca_list <- cbind.data.frame(cancer_type = rownames(ca_list),ca_list)
+ca_list$pct <- round(ca_list$nonOv_CTCF_int/ca_list$Total_CTCF_int*100,1)
+ca_list$unique <- unlist(ctcf_gr_unique)
+ca_list$pct_uniq <- round(ca_list$unique/ca_list$Total_CTCF_int*100,1)
+ca_list
+```
+
