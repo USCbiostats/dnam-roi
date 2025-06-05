@@ -1,0 +1,489 @@
+---
+title: "Genome_wide_heatmap"
+output: html_document
+date: "2025-05-30"
+---
+
+```{r setup, include=FALSE}
+###############################################################
+## 0. libraries & user-definable parameters
+###############################################################
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(ggplot2)
+  library(viridisLite)
+  library(patchwork)
+  library(rlang)   # put once at the top of the script if not loaded
+})
+
+```
+
+```{r}
+## -------- edit these only -----------------------------------
+data_dir   <- "data"               # where all *.bed live
+out_dir    <- "figs"               # write PDFs here
+tum_pairs  <- list(                # as many pairs as you like
+  # IA = c("IA","IB"),               # name =   c(tumourA, tumourB)
+  # JA = c("JA","JB"),
+  # DA = c("DA","DB"),
+  # HA = c("HA","HB"),
+  # MA = c("MA","MB")
+  # EA = c("EA","EB"),
+  # FA = c("FA","FB"),
+  # KA = c("KA","KB"),
+  # PA = c("PA","PB"),
+  SA = c("SA","SB"),
+  XA = c("XA","XB")
+)
+norm_samples  <- c(JN="JN", IN="IN", EN="EN")   # keep names ⇒ matched ID
+cov_min    <- 5L
+chr_keep   <- NULL     # NULL → whole genome
+bins_hex   <- 100         # grid resolution of triangle plots
+
+###############################################################
+```
+
+```{r}
+dir.create(out_dir, showWarnings = FALSE)
+std_chr <- paste0("chr", c(1:22,"X","Y"))
+
+read_wgbs <- function(sample, cov_min = 5L){
+  fn <- file.path(data_dir, paste0(sample, ".bed"))
+  dt <- fread(
+          fn,
+          col.names = c("chr","start","end","beta","cov","meth","unmeth")
+        )[cov >= cov_min]
+
+  if (!is.null(chr_keep))
+    dt <- dt[chr == chr_keep]
+
+  gr <- GRanges(dt$chr, IRanges(dt$start, dt$end), beta = dt$beta)
+  seqlevelsStyle(gr) <- "UCSC"
+
+  ## keep only chromosomes that are *both* standard and actually present
+  gr <- keepSeqlevels(gr,
+                      intersect(std_chr, seqlevels(gr)),
+                      pruning.mode = "coarse")
+  gr
+}
+
+
+## ---------------------------------------------------------------------
+## 1. ingest *all* samples
+##    returns a named GRangesList so we can index by ID later
+## ---------------------------------------------------------------------
+message("Reading BEDs …")
+all_ids   <- unique(c(unlist(tum_pairs), norm_samples))
+gr_by_id  <- GRangesList(lapply(all_ids, read_wgbs, cov_min = cov_min))
+names(gr_by_id) <- all_ids
+
+## helper that averages any set of GRanges objects
+mean_beta <- function(gr_list){
+  dt <- rbindlist(lapply(gr_list, \(g)
+      data.table(chr = as.character(seqnames(g)),
+                 pos = start(g),
+                 beta = mcols(g)$beta)))
+  dt[ , .(beta = mean(beta, na.rm = TRUE)), by = .(chr, pos)]
+}
+
+## 2. build *global* 5-CpG tiles once, reuse for every pair
+all_cpg <- rbindlist(lapply(gr_by_id, \(g)
+  data.table(chr = as.character(seqnames(g)), pos = start(g))))
+all_cpg <- unique(all_cpg)
+if (!is.null(chr_keep)) all_cpg <- all_cpg[chr == chr_keep]
+setorder(all_cpg, chr, pos)
+
+## assign window IDs
+all_cpg[ , grp := ((seq_len(.N) - 1L) %/% 5L) + 1L, by = chr]
+
+## collapse to one row per 5-CpG window
+tiles_dt <- all_cpg[ , .(start = min(pos),
+                         end   = max(pos)),
+                     by = .(chr, grp)]
+
+tiles_dt[ , wid := seq_len(.N)]        # give each window an ID
+
+tiles5 <- GRanges(tiles_dt$chr,
+                  IRanges(tiles_dt$start, tiles_dt$end))
+
+
+## quick function: mean β of one sample over the global 5-CpG tiles
+mean_over_tiles <- function(gr_sample){
+  ov <- findOverlaps(tiles5, gr_sample)
+  data.table(wid = queryHits(ov),
+             beta = mcols(gr_sample)$beta[ subjectHits(ov) ])[
+      , .(beta = mean(beta, na.rm = TRUE)), by = wid]
+}
+```
+
+
+```{r}
+# ========== saver ==========
+save_jpg <- function(p, pair_stub, fname, w = 6, h = 6){
+  dir_target <- file.path(out_dir, pair_stub)
+  dir.create(dir_target, showWarnings = FALSE, recursive = TRUE)
+  ggsave(file.path(dir_target, paste0(fname, ".jpg")), p,
+         width = w, height = h, units = "in", dpi = 1000, bg = "white")
+}
+
+# ========== base theme ==========
+base_theme <- theme_classic(base_size = 12) +
+              theme(legend.title = element_text(size = 12),
+                    legend.text  = element_text(size = 10),
+                    plot.title   = element_text(size = 12, face = "bold",
+                                                hjust = .5))
+
+# ========== triangle with mean lines ==========
+triangle_plot <- function(dt, xvar, yvar, xlab, title,
+                          pair_stub, file_stub){
+  mn_x <- mean(dt[[xvar]], na.rm = TRUE)
+  mn_y <- mean(dt[[yvar]], na.rm = TRUE)
+
+  p <- ggplot(dt, aes(.data[[xvar]], .data[[yvar]])) +
+         stat_bin2d(bins = bins_hex, drop = TRUE) +
+         scale_fill_viridis_c(trans = "log10", name = "5-CpG\nwindows") +
+         coord_equal(xlim = c(-1, 1), ylim = c(0, 1)) +
+         geom_vline(xintercept = mn_x, linetype = "dashed") +
+         geom_hline(yintercept = mn_y, linetype = "dashed") +
+         annotate("text", x = mn_x, y = 0, vjust = 1.4,
+                  label = sprintf("mean β̄TT = %.2f", mn_x), size = 3) +
+         annotate("text", x = -1, y = mn_y, hjust = -0.1, angle = 90,
+                  label = sprintf("mean PWD = %.2f", mn_y), size = 3) +
+         labs(title = title, x = xlab,
+              y = expression(paste("|", beta[A] - beta[B], "|  (PWD"[TT],")"))) +
+         base_theme
+
+  save_jpg(p, pair_stub, file_stub)
+}
+
+# ========== stratified triangles helpers ==========
+# ===============================================================
+# triangle_stratum()  -- draws ONE triangle, gets range in title
+# ===============================================================
+triangle_stratum <- function(dt, pair_stub, file_stub,
+                             stratum_lab, range_txt){
+
+  mn_x <- mean(dt$mean_TT, na.rm = TRUE)
+  mn_y <- mean(dt$pwd_TT,  na.rm = TRUE)
+
+  p <- ggplot(dt, aes(mean_TT, pwd_TT)) +
+         stat_bin2d(bins = bins_hex, drop = TRUE) +
+         scale_fill_viridis_c(trans = "log10", name = "windows") +
+         coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+         geom_vline(xintercept = mn_x, linetype = "dashed") +
+         geom_hline(yintercept = mn_y, linetype = "dashed") +
+         annotate("text", x = mn_x, y = 0,  vjust = 1.4, size = 3,
+                  label = sprintf("mean β̄TT = %.2f", mn_x)) +
+         annotate("text", x = 0,  y = mn_y, hjust = -0.1, angle = 90, size = 3,
+                  label = sprintf("mean PWD = %.2f", mn_y)) +
+         labs(
+           title = paste0(stratum_lab, " (β ", range_txt, "): β̄TT vs PWD"),
+           x = expression(bar(beta)[TT]),
+           y = expression(paste("|", beta[A] - beta[B], "|  (PWD"[TT],")"))
+         ) +
+         base_theme
+
+  save_jpg(p, pair_stub, file_stub, w = 6, h = 6)
+}
+
+# ===============================================================
+# make_stratified_triangles()  -- assigns strata & calls above
+# ===============================================================
+make_stratified_triangles <- function(dt_tiles, normal_column, pair_stub){
+
+  ## assign three bins by normal β value
+  dt_tiles[ , stratum := fifelse(
+              get(normal_column) < 0.20,  "HYPO",
+              fifelse(get(normal_column) < 0.80, "MID", "HYPER"))]
+
+  ## label text for the title
+  range_txt <- c(HYPO = "<0.20", MID = "0.20–0.80", HYPER = ">0.80")
+
+  for (lvl in c("HYPO","MID","HYPER")){
+    sub <- dt_tiles[stratum == lvl & !is.na(mean_TT) & !is.na(pwd_TT)]
+    if (!nrow(sub)) next
+
+    triangle_stratum(sub,
+                     pair_stub       = pair_stub,
+                     file_stub       = paste0("triangle_", pair_stub, "_", tolower(lvl)),
+                     stratum_lab     = lvl,
+                     range_txt       = range_txt[[lvl]])
+  }
+}
+
+
+
+# ========== heat_plot (diverging palette, alpha mapped) ==========
+heat_plot <- function(dt, fill_var, fill_name, title,
+                      pair_stub, file_stub){
+  p <- ggplot(dt, aes(beta_A, beta_B)) +
+         coord_equal(xlim = c(0,1), ylim = c(0,1)) +
+         geom_abline(colour = "grey60", linewidth = .3) +
+         base_theme +
+         labs(title = title,
+              x = bquote(beta[.(tumA)]),
+              y = bquote(beta[.(tumB)]))
+
+  if (fill_var == "..count.."){
+    p <- p +
+         stat_bin2d(aes(fill = ..count..), bins = bins_hex) +
+         scale_fill_viridis_c(trans = "log10", name = "Windows")
+  } else {
+    p <- p +
+         geom_point(aes(colour = .data[[fill_var]],
+                        alpha  = abs(.data[[fill_var]])),
+                    shape = 15, size = 1.4) +
+         scale_colour_gradient2(low = "#2166ac", mid = "white",
+                                high = "#b2182b", midpoint = 0,
+                                limits = c(-1,1), name = fill_name,
+                                na.value = "transparent") +
+         scale_alpha(range = c(.1,1), guide = "none", na.value = 0)
+  }
+  save_jpg(p, pair_stub, file_stub)
+}
+
+# ========== extract region help helpers ==========
+extract_regions <- function(dt_tiles,
+                            tiles_meta,          # tiles_dt with chr/start/end/wid
+                            delta_col,           # e.g. "delta_N" or "delta_IN"
+                            thr = 0.30,          # absolute Δβ cut-off
+                            direction = c("hyper", "hypo", "both"),
+                            outfile_stub = NULL) {
+
+  direction <- match.arg(direction)
+
+  ## choose rows ---------------------------------------------------------
+  if (direction == "hyper")
+    keep <- dt_tiles[get(delta_col) >= thr]
+  else if (direction == "hypo")
+    keep <- dt_tiles[get(delta_col) <= -thr]
+  else
+    keep <- dt_tiles[abs(get(delta_col)) >= thr]
+
+  ## add genomic coordinates --------------------------------------------
+  keep <- merge(keep, tiles_meta, by = "wid", all.x = TRUE)
+
+  ## order nicely
+  setorder(keep, chr, start)
+
+  ## write to disk if asked
+  if (!is.null(outfile_stub) && nrow(keep)){
+    fwrite(keep[ , .(chr, start, end,
+                     delta = get(delta_col),
+                     mean_TT, pwd_TT)],
+           file = paste0(outfile_stub, ".tsv"), sep = "\t")
+  }
+
+  invisible(keep)
+}
+```
+
+
+```{r}
+
+#######################################################################
+##  QC TABLE 1 : per-sample basic metrics
+##  ---------------------------------------------------------------
+##  * total CpGs in BED
+##  * mean / median β
+##  * mean / median / max depth
+##  * fraction of CpGs with coverage ≥ 5
+#######################################################################
+
+library(knitr)        # for kable()
+
+sample_qc <- rbindlist(lapply(all_ids, function(id){
+  fn <- file.path(data_dir, paste0(id, ".bed"))
+  dt <- fread(fn,
+              col.names = c("chr","start","end","beta","cov","meth","unmeth"))
+
+  list(sample        = id,
+       total_CpGs    = nrow(dt),
+       avg_beta      = mean(dt$beta,  na.rm = TRUE),
+       median_beta   = median(dt$beta, na.rm = TRUE),
+       avg_depth     = mean(dt$cov,   na.rm = TRUE),
+       median_depth  = median(dt$cov, na.rm = TRUE),
+       max_depth     = max(dt$cov,    na.rm = TRUE),
+       frac_depth5   = mean(dt$cov >= 5))
+}))
+
+cat("\n### Sample-level QC\n")
+kable(sample_qc, digits = 3)
+
+#######################################################################
+##  QC TABLE 2 : tumour-pair window metrics
+##  ---------------------------------------------------------------
+##  * number of 5-CpG windows analysed
+##  * mean / median β̄TT
+##  * mean / median PWDTT
+##  * min / max PWDTT  (range)
+#######################################################################
+
+pair_stats <- list()   # collect inside the loop
+
+```
+
+```{r}
+## ---------------------------------------------------------------------
+## 3.  loop over each tumour pair  (full in-memory workflow)
+## ---------------------------------------------------------------------
+for (pair_name in names(tum_pairs)) {
+
+  tumA <- tum_pairs[[pair_name]][1]
+  tumB <- tum_pairs[[pair_name]][2]
+  message("Processing pair: ", tumA, " vs ", tumB)
+
+  ## ---------- 3a.  β per window for tumours + mean-normal -----------
+  beta_A <- mean_over_tiles(gr_by_id[[tumA]]); setnames(beta_A, "beta", "beta_A")
+  beta_B <- mean_over_tiles(gr_by_id[[tumB]]); setnames(beta_B, "beta", "beta_B")
+
+  ## three-normal mean
+  beta_N <- mean_beta(gr_by_id[norm_samples])
+  grN    <- GRanges(beta_N$chr, IRanges(beta_N$pos, beta_N$pos), beta = beta_N$beta)
+  beta_N_tile <- mean_over_tiles(grN); setnames(beta_N_tile, "beta", "beta_N")
+
+  ## matched single normals (IN, JN, EN) — if present
+  matched_A <- sub("[A-Z]$", "N", tumA)   # “IA” → “IN”
+  matched_B <- sub("[A-Z]$", "N", tumB)
+  matched_normals <- intersect(c(matched_A, matched_B), names(gr_by_id))
+
+  betas_extra <- lapply(matched_normals, function(mn){
+      tmp <- mean_over_tiles(gr_by_id[[mn]])
+      setnames(tmp, "beta", paste0("beta_", mn)); tmp})
+  names(betas_extra) <- matched_normals
+
+  ## ---------- 3b.  master table: one row per 5-CpG window ----------
+  dt_tiles <- Reduce(function(x, y) merge(x, y, by = "wid", all = TRUE),
+                     c(list(beta_A, beta_B, beta_N_tile), betas_extra))
+
+  ## derived columns
+  dt_tiles[ , mean_TT := rowMeans(.SD, na.rm = TRUE),
+            .SDcols = c("beta_A", "beta_B")]
+  dt_tiles[ , pwd_TT  := abs(beta_A - beta_B)]
+  dt_tiles[ , delta_N := mean_TT - beta_N]
+
+  for (mn in matched_normals)
+    dt_tiles[ , (paste0("delta_", mn)) :=
+                mean_TT - get(paste0("beta_", mn))]
+
+  ## ---------- 3c.  QC row for this pair ----------------------------
+  pair_stats[[pair_name]] <- list(
+    pair          = pair_name,
+    n_windows     = nrow(dt_tiles),
+    mean_betaTT   = mean(dt_tiles$mean_TT, na.rm = TRUE),
+    median_betaTT = median(dt_tiles$mean_TT, na.rm = TRUE),
+    mean_pwdTT    = mean(dt_tiles$pwd_TT,  na.rm = TRUE),
+    median_pwdTT  = median(dt_tiles$pwd_TT, na.rm = TRUE),
+    pwd_min       = min(dt_tiles$pwd_TT, na.rm = TRUE),
+    pwd_max       = max(dt_tiles$pwd_TT, na.rm = TRUE)
+  )
+
+  ## ==================================================================
+  ## 4.  TRIANGLE PLOTS
+  ## ==================================================================
+
+  ## 4a.  β̄TT vs PWDTT
+  triangle_plot(dt_tiles, "mean_TT", "pwd_TT",
+                xlab  = expression(bar(beta)[TT]),
+                title = paste0(tumA, " vs ", tumB, ": β̄TT vs PWD"),
+                pair_stub = pair_name,
+                file_stub = paste0("triangle_", pair_name))
+
+  ## 4b.  Δβ (tumour – mean normal) vs PWDTT
+  triangle_plot(dt_tiles, "delta_N", "pwd_TT",
+                xlab  = expression(Delta*bar(beta)[TT-N]),
+                title = paste0(tumA, " vs ", tumB, ": Δβ vs PWD"),
+                pair_stub = pair_name,
+                file_stub = paste0("triangle_shift_", pair_name))
+
+  ## 4c.  Δβ vs each matched normal
+  for (mn in matched_normals){
+    triangle_plot(dt_tiles, paste0("delta_", mn), "pwd_TT",
+                  xlab  = bquote(Delta*bar(beta)[TT-.(mn)]),
+                  title = paste0(tumA, " vs ", tumB, ": Δβ vs ", mn),
+                  pair_stub = pair_name,
+                  file_stub = paste0("triangle_shift_", pair_name, "_", mn))
+  }
+
+  ## 4d.  stratified triangles
+  make_stratified_triangles(dt_tiles, "beta_N", pair_name)
+  for (mn in matched_normals){
+    make_stratified_triangles(dt_tiles,
+                              normal_column = paste0("beta_", mn),
+                              pair_stub     = paste0(pair_name, "_", mn))
+  }
+
+  ## ==================================================================
+  ## 5.  HEAT-MAPS
+  ## ==================================================================
+
+  ## 5a.  raw β density
+  heat_plot(dt_tiles, "..count..", "",
+            paste0(tumA, " vs ", tumB, ": raw β"),
+            pair_stub = pair_name,
+            file_stub = paste0("heat_raw_", pair_name))
+
+  ## 5b.  Δβ vs mean normal
+  heat_plot(dt_tiles, "delta_N", "Δβ (vs 3 normals)",
+            paste0(tumA, " vs ", tumB, ": Δβ (tumour – mean normal)"),
+            pair_stub = pair_name,
+            file_stub = paste0("heat_shift_", pair_name))
+
+  ## 5c.  Δβ vs matched normal(s)
+  for (mn in matched_normals){
+    heat_plot(dt_tiles, paste0("delta_", mn),
+              bquote(Delta*beta~"(vs "~.(mn)*")"),
+              paste0(tumA, " vs ", tumB, ": Δβ vs ", mn),
+              pair_stub = pair_name,
+              file_stub = paste0("heat_shift_", pair_name, "_", mn))
+  }
+
+  ## ==================================================================
+  ## 6.  hyper / hypo region tables
+  ## ==================================================================
+  extract_regions(dt_tiles, tiles_dt, "delta_N", 0.30, "hyper",
+                  file.path(out_dir, pair_name, paste0("hyper_", pair_name)))
+  extract_regions(dt_tiles, tiles_dt, "delta_N", 0.30, "hypo",
+                  file.path(out_dir, pair_name, paste0("hypo_", pair_name)))
+
+  for (mn in matched_normals){
+    extract_regions(dt_tiles, tiles_dt, paste0("delta_", mn), 0.30, "both",
+                    file.path(out_dir, pair_name,
+                              paste0("delta_", mn, "_", pair_name)))
+  }
+}
+
+message("DONE.  Figures in: ", normalizePath(out_dir))
+
+```
+
+
+
+```{r}
+###############################################################
+## 3.  QC TABLE 2 — tumour-pair window metrics  (after all batches)
+###############################################################
+pair_qc <- rbindlist(pair_stats)
+
+cat("\n\n### Tumour-pair window QC\n")
+kable(pair_qc, digits = 3)
+```
+```{r}
+#####################################################################
+## 7.  HOUSE-KEEPING  — drop big objects & return RAM to the OS
+#####################################################################
+big_objs <- c("gr_by_id", "all_cpg", "tiles_dt", "tiles5",
+              "dt_tiles", "beta_A", "beta_B", "beta_N_tile",
+              ls(pattern = "^beta_[A-Z]{2}$"))  # any leftover beta_* tables
+
+rm(list = intersect(big_objs, ls()), envir = .GlobalEnv)
+gc(verbose = TRUE)
+
+cat("\n### Memory cleared — ready for the next batch ###\n")
+
+```
+
+
