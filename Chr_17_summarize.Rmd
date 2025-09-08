@@ -1,0 +1,414 @@
+---
+title: "Chr_17_summarize"
+output: html_document
+date: "2025-08-29"
+---
+
+```{r setup, include=FALSE}
+###############################################################
+## chr17 PWD overview + UCSC gene/promoter import
+## Requires 'res' from your tiling pipeline:
+##   res$summary_dt  (tile × sample with mean_beta, n_cpg, ...)
+##   res$tiles_dt    (chr, start[0-based], end, tile)
+###############################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+})
+
+```
+
+```{r}
+stopifnot(exists("res"))
+summary_dt <- as.data.table(res$summary_dt)
+tiles_dt   <- as.data.table(res$tiles_dt)
+
+## --- USER KNOBS ------------------------------------------------------------
+chr_use   <- if (exists("params") && !is.null(params$chr)) params$chr else "chr17"
+
+## Define *all* tumour pairs you want summarized (names = labels on plots)
+## Add/remove pairs freely; everything below adapts.
+pair_list <- list(
+  Pair_E = c("EA","EB"),
+  Pair_I = c("IA","IB"),
+  Pair_F = c("FA","FB"), 
+  Pair_S = c("SA","SB"),
+  Pair_M = c("MA","MB"),
+  Pair_D = c("DA","DB"),
+  Pair_K = c("KA","KB"),
+  Pair_P = c("PA","PB"),
+  Pair_X = c("XA","XB"),
+  Pair_H = c("HA","HB")
+)
+
+## Define normals (>=2; all pairwise combos will be averaged per tile)
+normals <- c("IN","JN","EN")
+
+## --- Tiles as GRanges (0-based BED -> 1-based GRanges) --------------------
+tiles_gr <- GRanges(seqnames = tiles_dt$chr,
+                    ranges   = IRanges(tiles_dt$start + 1L, tiles_dt$end))
+```
+
+
+```{r}
+################################################################
+## 1) UCSC (TxDb) annotations on chr17
+################################################################
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+## promoters/CDS per gene (union across transcripts)
+tx_by_gene   <- transcriptsBy(txdb, by = "gene")
+
+prom_by_gene <- promoters(tx_by_gene, upstream = 2000, downstream = 200)
+prom_by_gene <- endoapply(prom_by_gene, reduce)
+
+cds_by_gene  <- cdsBy(txdb, by = "gene")
+cds_by_gene  <- endoapply(cds_by_gene, reduce)
+
+## keep only chr17 & drop empty genes
+keep_chr <- function(grl, chr){
+  out <- endoapply(grl, \(g) keepSeqlevels(g, chr, pruning.mode = "coarse"))
+  out[elementNROWS(out) > 0L]
+}
+prom_by_gene <- keep_chr(prom_by_gene, chr_use)
+cds_by_gene  <- keep_chr(cds_by_gene,  chr_use)
+
+## --- Annotation overview (counts & lengths) -------------------------------
+len_per_gene <- function(grl) sapply(grl, \(g) sum(width(g)))
+
+prom_len <- len_per_gene(prom_by_gene)           # length covered by promoter(s) per gene
+cds_len  <- len_per_gene(cds_by_gene)            # length covered by CDS per gene
+
+summ_len <- function(x){
+  data.table(
+    n_items  = length(x),
+    min_bp   = min(x),
+    mean_bp  = mean(x),
+    median_bp= as.numeric(median(x)),
+    max_bp   = max(x)
+  )
+}
+
+
+```
+```{r}
+anno_overview <- rbindlist(list(
+  cbind(region = "promoter", summ_len(prom_len)),
+  cbind(region = "CDS",      summ_len(cds_len))
+))
+anno_overview
+```
+
+
+```{r}
+################################################################
+## 2) Tile category (promoter / CDS / other)
+################################################################
+## flatten promoter/CDS to GRanges for overlaps
+prom_gr <- unlist(prom_by_gene, use.names = FALSE)
+cds_gr  <- unlist(cds_by_gene,  use.names = FALSE)
+
+prom_hits <- subjectHits(findOverlaps(prom_gr, tiles_gr))
+cds_hits  <- subjectHits(findOverlaps(cds_gr,  tiles_gr))
+
+tile_cat <- data.table(tile = seq_len(length(tiles_gr)), category = "other")
+tile_cat[tile %in% cds_hits,  category := "CDS"]
+tile_cat[tile %in% prom_hits, category := "promoter"]   # promoter overrides CDS
+```
+
+
+```{r}
+################################################################
+## 3) PWD per tile for tumour pairs and normals (generic)
+################################################################
+pair_pwd <- function(s1, s2){
+  merge(summary_dt[sample == s1, .(tile, b1 = mean_beta)],
+        summary_dt[sample == s2, .(tile, b2 = mean_beta)],
+        by = "tile")[ , .(tile, pwd = abs(b1 - b2))]
+}
+
+## 3a) tumour pairs
+pwd_pairs <- rbindlist(lapply(names(pair_list), function(lbl){
+  s <- pair_list[[lbl]]
+  pair_pwd(s[1], s[2])[, group := lbl]
+}), use.names = TRUE)
+
+## 3b) normals: average the PWD from *all* pairwise normal combos, per tile
+norm_combos   <- combn(normals, 2, simplify = FALSE)
+pwd_norm_all  <- rbindlist(lapply(norm_combos, \(p) pair_pwd(p[1], p[2])))
+pwd_norm_mean <- pwd_norm_all[, .(pwd = mean(pwd, na.rm = TRUE)), by = tile][
+  , group := "Normals_avgPairs"]
+
+## 3c) stack
+pwd_by_tile <- rbindlist(list(pwd_pairs, pwd_norm_mean), use.names = TRUE)
+group_levels <- c(names(pair_list), "Normals_avgPairs")
+
+################################################################
+## 4) Summaries
+################################################################
+summarize_pwd <- function(dt){
+  if (nrow(dt) == 0L) return(data.table(
+    n_tiles=0L, min_pwd=NA_real_, max_pwd=NA_real_,
+    mean_pwd=NA_real_, median_pwd=NA_real_, p05=NA_real_, p95=NA_real_
+  ))
+  dt[ , .(
+    n_tiles    = .N,
+    min_pwd    = min(pwd, na.rm = TRUE),
+    max_pwd    = max(pwd, na.rm = TRUE),
+    mean_pwd   = mean(pwd, na.rm = TRUE),
+    median_pwd = as.numeric(median(pwd, na.rm = TRUE)),
+    p05        = as.numeric(quantile(pwd, 0.05, na.rm = TRUE)),
+    p95        = as.numeric(quantile(pwd, 0.95, na.rm = TRUE))
+  )]
+}
+
+## 4.1 Global (all tiles)
+global_summary <- pwd_by_tile[ , summarize_pwd(.SD), by = group][
+  order(factor(group, levels = group_levels))]
+
+## 4.2 By category (Promoter / CDS / Other)
+pwd_cats <- merge(pwd_by_tile, tile_cat, by = "tile")
+category_summary <- pwd_cats[ , summarize_pwd(.SD), by = .(group, category)][
+  order(factor(group, levels = group_levels),
+        factor(category, levels = c("promoter","CDS","other")))]
+
+################################################################
+## 5)  CpG-aware overview (PWD + CpG + mean β)  -- generic
+################################################################
+## Per-group β per tile: for pairs, average across the two samples *only where both present*;
+## for normals, mean across all normals.
+beta_pairs <- rbindlist(lapply(names(pair_list), function(lbl){
+  s <- pair_list[[lbl]]
+  merge(summary_dt[sample == s[1], .(tile, b1 = mean_beta)],
+        summary_dt[sample == s[2], .(tile, b2 = mean_beta)],
+        by = "tile")[ , .(tile, beta = (b1 + b2)/2, group = lbl)]
+}), use.names = TRUE)
+
+beta_norm <- summary_dt[sample %in% normals,
+                        .(beta = mean(mean_beta, na.rm = TRUE)), by = tile][
+                        , group := "Normals_avgPairs"]
+
+beta_by_tile <- rbindlist(list(beta_pairs, beta_norm), use.names = TRUE)
+
+## CpG density per tile (across samples)
+cpg_per_tile <- summary_dt[, .(cpg_mean = mean(n_cpg, na.rm = TRUE)), by = tile]
+
+## keep only rows that have PWD, then add CpG; drop NA categories if any
+cpg_pwd_beta <- pwd_cats[beta_by_tile, on = .(tile, group), nomatch = 0L][
+  cpg_per_tile, on = .(tile), nomatch = 0L][
+  !is.na(category)]
+
+cpg_overview <- cpg_pwd_beta[ , .(
+  n_tiles    = .N,
+  mean_cpg   = mean(cpg_mean),
+  mean_pwd   = mean(pwd),
+  median_pwd = as.numeric(median(pwd)),
+  mean_beta  = mean(beta)
+), by = .(group, category)][
+  order(factor(group, levels = group_levels),
+        factor(category, levels = c("promoter","CDS","other")))]
+
+```
+
+
+```{r}
+################################################################
+## 6) RESULTS --------------------------------------------------
+################################################################
+list(
+  global_summary   = global_summary,   # PWD across all tiles, per group
+  #category_summary = category_summary, # PWD by promoter/CDS/other, per group
+  cpg_overview     = cpg_overview      # CpG-vs-PWD snapshot
+)
+
+
+```
+
+```{r}
+library(data.table)
+library(ggplot2)
+
+## Build the plotting table -----------------------------------------------
+stopifnot(exists("cpg_overview"))
+
+ov <- as.data.table(cpg_overview)[
+  !is.na(category),                       # drop any NA-category rows
+  .(group, category, mean_cpg, mean_pwd) # keep only what the plots need
+]
+
+## (optional) exclude normals
+# ov <- ov[group != "Normals_avgPairs"]
+
+## tidy factors for nice ordering
+ov[, category := factor(category, levels = c("promoter","CDS","other"))]
+ov[, group    := factor(group,    levels = unique(group))]
+
+## ---- Option A: lollipop facets (PWD on y, CpG as point size) ------------
+p_lolli <- ggplot(ov, aes(x = category, y = mean_pwd, colour = category)) +
+  geom_segment(aes(xend = category, y = 0, yend = mean_pwd),
+               linewidth = 1.0, alpha = 0.6) +
+  geom_point(aes(size = mean_cpg), alpha = 0.9) +
+  facet_wrap(~ group, ncol = 3, scales = "free_y") +
+  scale_size_continuous(name = "Mean CpG / tile (100bp)") +
+  scale_y_continuous(name = "Mean PWD (|Δβ|)", limits = c(0, NA)) +
+  scale_colour_manual(values = c("promoter"="#1b9e77","CDS"="#7570b3","other"="#d95f02"),
+                      guide = "none") +
+  labs(x = NULL,
+       title = "Conservation by category: mean PWD (y) with CpG density (point size)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(p_lolli)
+```
+
+
+```{r}
+
+
+## TRY 100 BP, does this hold
+stopifnot(exists("res"))
+summary_dt <- as.data.table(res$summary_dt)
+tiles_dt   <- as.data.table(res$tiles_dt)
+
+## --- USER KNOBS ------------------------------------------------------------
+chr_use  <- if (exists("params") && !is.null(params$chr)) params$chr else "chr17"
+pair_E   <- c("EA","EB")
+pair_I   <- c("IA","IB")
+normals  <- c("IN","JN","EN")
+
+## --- Tiles as GRanges (0-based BED -> 1-based GRanges) --------------------
+tiles_gr <- GRanges(seqnames = tiles_dt$chr,
+                    ranges   = IRanges(tiles_dt$start + 1L, tiles_dt$end))
+
+################################################################
+## 2) Tile category (promoter / CDS / other)
+################################################################
+## flatten promoter/CDS to GRanges for overlaps
+prom_gr <- unlist(prom_by_gene, use.names = FALSE)
+cds_gr  <- unlist(cds_by_gene,  use.names = FALSE)
+
+prom_hits <- subjectHits(findOverlaps(prom_gr, tiles_gr))
+cds_hits  <- subjectHits(findOverlaps(cds_gr,  tiles_gr))
+
+tile_cat <- data.table(tile = seq_len(length(tiles_gr)), category = "other")
+tile_cat[tile %in% cds_hits,  category := "CDS"]
+tile_cat[tile %in% prom_hits, category := "promoter"]   # promoter overrides CDS
+
+################################################################
+## 3) PWD per tile for tumour pairs and normals
+################################################################
+pair_pwd <- function(s1, s2){
+  merge(summary_dt[sample == s1, .(tile, b1 = mean_beta)],
+        summary_dt[sample == s2, .(tile, b2 = mean_beta)],
+        by = "tile")[ , .(tile, pwd = abs(b1 - b2))]
+}
+
+# tumour pairs
+pwd_E <- pair_pwd(pair_E[1], pair_E[2])[, group := "Pair_E"]
+pwd_I <- pair_pwd(pair_I[1], pair_I[2])[, group := "Pair_I"]
+
+# normals: average across the 3 normal pairs, **per tile**
+norm_pairs   <- list(c("IN","JN"), c("IN","EN"), c("JN","EN"))
+pwd_norm_all <- rbindlist(lapply(norm_pairs, \(p) pair_pwd(p[1], p[2])))
+
+pwd_N <- pwd_norm_all[
+  , .(pwd = mean(pwd, na.rm = TRUE)), by = tile][
+  , group := "Normals_avgPairs"]
+
+# stack
+pwd_by_tile <- rbindlist(list(pwd_E, pwd_I, pwd_N), use.names = TRUE)
+
+################################################################
+## 4) Summaries
+################################################################
+summarize_pwd <- function(dt){
+  if (nrow(dt) == 0L) return(data.table(
+    n_tiles = 0L, min_pwd = NA_real_, max_pwd = NA_real_,
+    mean_pwd = NA_real_, median_pwd = NA_real_,
+    p05 = NA_real_, p95 = NA_real_
+  ))
+  dt[ , .(
+    n_tiles    = .N,
+    min_pwd    = min(pwd, na.rm = TRUE),
+    max_pwd    = max(pwd, na.rm = TRUE),
+    mean_pwd   = mean(pwd, na.rm = TRUE),
+    median_pwd = as.numeric(median(pwd, na.rm = TRUE)),
+    p05        = as.numeric(quantile(pwd, 0.05, na.rm = TRUE)),
+    p95        = as.numeric(quantile(pwd, 0.95, na.rm = TRUE))
+  )]
+}
+
+## 4.1 Global (all tiles)
+global_summary <- pwd_by_tile[ , summarize_pwd(.SD), by = group][
+  order(factor(group, levels = c("Pair_E","Pair_I","Normals_avgPairs")))]
+
+## 4.2 By category (Promoter / CDS / Other)
+pwd_cats <- merge(pwd_by_tile, tile_cat, by = "tile")
+category_summary <- pwd_cats[ , summarize_pwd(.SD), by = .(group, category)][
+  order(factor(group, levels = c("Pair_E","Pair_I","Normals_avgPairs")),
+        factor(category, levels = c("promoter","CDS","other")))]
+
+################################################################
+## 5)  CpG-aware overview — useful sanity check
+################################################################
+
+## ------------------------------------------------------------------
+## Add mean β (average methylation rate) to the CpG-aware overview
+## ------------------------------------------------------------------
+
+## 1) Per-tile average β within each group
+beta_E <- summary_dt[sample %in% pair_E,
+                     .(beta = mean(mean_beta, na.rm = TRUE)), by = tile][
+                     , group := "Pair_E"]
+
+beta_I <- summary_dt[sample %in% pair_I,
+                     .(beta = mean(mean_beta, na.rm = TRUE)), by = tile][
+                     , group := "Pair_I"]
+
+beta_N <- summary_dt[sample %in% normals,
+                     .(beta = mean(mean_beta, na.rm = TRUE)), by = tile][
+                     , group := "Normals_avgPairs"]
+
+beta_by_tile <- rbindlist(list(beta_E, beta_I, beta_N), use.names = TRUE)
+
+## 2) Bring in tile categories (promoter/CDS/other)
+beta_cats <- merge(beta_by_tile, tile_cat, by = "tile")
+
+## 3) Summarize mean β per group × category
+beta_summary <- beta_cats[ , .(
+  mean_beta = mean(beta, na.rm = TRUE)
+), by = .(group, category)]
+
+## 4) Append to your existing cpg_overview and keep the same ordering
+cpg_overview <- merge(
+  cpg_overview,               # your table with n_tiles, mean_cpg, mean_pwd, median_pwd
+  beta_summary,
+  by = c("group","category"),
+  all.x = TRUE
+)[
+  order(factor(group, levels = c("Pair_E","Pair_I","Normals_avgPairs")),
+        factor(category, levels = c("promoter","CDS","other")))
+]
+
+################################################################
+## 6) RESULTS --------------------------------------------------
+################################################################
+list(
+  global_summary   = global_summary,   # PWD across all tiles, per group
+  #category_summary = category_summary, # PWD by promoter/CDS/other, per group
+  cpg_overview     = cpg_overview      # CpG-vs-PWD snapshot
+)
+
+
+```
+
+
+
+
+
+
+

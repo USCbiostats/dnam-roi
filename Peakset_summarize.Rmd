@@ -1,0 +1,42 @@
+---
+title: "Peakset_summarize"
+output: html_document
+date: "2025-07-17"
+---
+
+```{r setup, include=FALSE}
+## ---------- load packages ----------
+library(readr)      # fast CSV reader
+library(dplyr)      # pipes & summarise
+
+```
+
+```{r}
+
+## ---------- read data ----------
+motifs <- read_csv(
+  "data/COAD_cleaned_motifs.csv",
+  col_types = cols()   # let readr guess; tweak if needed
+)
+
+## ---------- add an interval length column ----------
+# BED–style coordinates are half-open, so width = end - start
+motifs <- motifs %>%
+  mutate(interval_bp = end - start)
+
+## ---------- summarise by motif group ----------
+summary_tbl <- motifs %>%
+  group_by(group_name) %>%
+  summarise(
+    n_intervals = n(),                     # how many hits in the group
+    min_interval = min(interval_bp),       # shortest width
+    max_interval = max(interval_bp),       # longest width
+    mean_interval = mean(interval_bp),     # average width
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_intervals))               # optional: most abundant first
+
+print(summary_tbl, n = Inf)                # show everything
+
+```
+

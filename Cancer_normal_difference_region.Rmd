@@ -1,0 +1,182 @@
+---
+title: "Cancer_tumor differences"
+output: html_document
+date: "2025-07-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+##########################  USER SETTINGS  ##########################
+data_dir   <- "data"                      # *.bed files live here
+out_dir    <- "figs"                      # all output will be nested here
+cov_min    <- 5L                          # minimum coverage per CpG
+chr_keep   <- NULL            # e.g. "chr13" for testing; NULL = whole genome
+
+## tumour pairs you want to process ----------------------------
+tum_pairs <- list(
+  IA = c("HA","HB"),
+  JA = c("MA","MB")          # add/remove freely
+)
+
+## normals you want to average for the “reference normal”
+norm_samples <- c("JN","IN","EN")
+###################################################################
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GenomicRanges)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(ggplot2)
+  library(viridisLite)
+  library(patchwork)
+})
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+std_chr <- paste0("chr", c(1:22,"X","Y"))
+
+# ------------ helper ------------------------------------------------------
+read_wgbs <- function(id){
+  fn <- file.path(data_dir, paste0(id, ".bed"))
+  dt <- fread(fn,
+              col.names = c("chr","start","end","beta",
+                            "cov","meth","unmeth"))[
+              cov >= cov_min]
+  if (!is.null(chr_keep)) dt <- dt[chr == chr_keep]
+  gr <- GRanges(dt$chr, IRanges(dt$start, dt$end), beta = dt$beta)
+  seqlevelsStyle(gr) <- "UCSC"
+  keep <- intersect(std_chr, seqlevels(gr))
+  keepSeqlevels(gr, keep, pruning.mode = "coarse")
+}
+
+# ------------ load every sample once -------------------------------------
+all_ids <- unique(c(unlist(tum_pairs), norm_samples))
+message("Reading ", length(all_ids), " BED files …")
+gr_by_id <- GRangesList(lapply(all_ids, read_wgbs))
+names(gr_by_id) <- all_ids
+
+# ------------ build a single 5-CpG tiling --------------------------------
+cpg_union <- rbindlist(lapply(gr_by_id, \(g)
+  data.table(chr = as.character(seqnames(g)), pos = start(g))))
+cpg_union <- unique(cpg_union)
+if (!is.null(chr_keep)) cpg_union <- cpg_union[chr == chr_keep]
+setorder(cpg_union, chr, pos)
+cpg_union[ , grp := ((seq_len(.N)-1L) %/% 5L) + 1L, by = chr]
+
+tiles <- cpg_union[ , .(start = min(pos), end = max(pos)), by = .(chr, grp)]
+tiles[ , wid := .I]
+tiles_gr <- GRanges(tiles$chr, IRanges(tiles$start, tiles$end))
+
+# helper: mean β of *one* GRanges over the global tiles --------------------
+mean_over_tiles <- function(gr){
+  ov <- findOverlaps(tiles_gr, gr)
+  data.table(wid = queryHits(ov),
+             beta = mcols(gr)$beta[ subjectHits(ov) ])[
+      , .(beta = mean(beta, na.rm = TRUE)), by = wid]
+}
+
+# pre-compute normal reference once ---------------------------------------
+beta_norm <- mean_over_tiles(
+               do.call(S4Vectors::c(), gr_by_id[ norm_samples ]) )
+setnames(beta_norm, "beta", "beta_N")
+
+# container for QC rows ----------------------------------------------------
+pair_stats <- list()
+
+# =========================================================================
+# LOOP over every tumour pair
+# =========================================================================
+for (pair_name in names(tum_pairs)) {
+
+  tumA <- tum_pairs[[pair_name]][1]
+  tumB <- tum_pairs[[pair_name]][2]
+  cat("\n▶  Processing", pair_name, ":", tumA, "vs", tumB, "\n")
+
+  # ---- β per tile for the two tumours -----------------------------------
+  beta_A <- mean_over_tiles(gr_by_id[[tumA]]); setnames(beta_A, "beta", "beta_A")
+  beta_B <- mean_over_tiles(gr_by_id[[tumB]]); setnames(beta_B, "beta", "beta_B")
+
+  # ---- merge & derive metrics -------------------------------------------
+  dt <- Reduce(function(x,y) merge(x,y, by = "wid", all = FALSE),
+               list(beta_A, beta_B, beta_norm))
+
+  dt[ , `:=`(
+        mean_TT = (beta_A + beta_B)/2,
+        pwd_TT  = abs(beta_A - beta_B),
+        delta_N = (beta_A + beta_B)/2 - beta_N
+      )]
+
+  # ---- conservation in normals & tumours --------------------------------
+  cons_norm   <- dt[beta_N  >= 0.80 | beta_N  <= 0.20]
+  cons_norm_T <- cons_norm[mean_TT >= 0.80 | mean_TT <= 0.20]
+
+  frac_norm   <- nrow(cons_norm)   / nrow(dt)
+  frac_norm_T <- nrow(cons_norm_T) / nrow(dt)
+
+  pair_stats[[pair_name]] <- data.table(
+      pair          = pair_name,
+      frac_norm     = frac_norm,
+      frac_norm_T   = frac_norm_T)
+
+  # ---- write BED-like tables for follow-up -------------------------------
+  fwrite(cons_norm,
+         file = file.path(out_dir, pair_name, "cons_norm.tsv"), sep = "\t")
+  fwrite(cons_norm_T,
+         file = file.path(out_dir, pair_name, "cons_norm_and_tumour.tsv"),
+         sep = "\t")
+
+  # ---- plots -------------------------------------------------------------
+  plot_triangle <- function(x, y, title, file_stub){
+    p <- ggplot(dt, aes({{x}}, {{y}})) +
+           stat_bin2d(bins = 120) +
+           scale_fill_viridis_c(trans = "log10") +
+           geom_abline(colour = "grey70") +
+           coord_equal(xlim = c(-1,1), ylim = c(0,1)) +
+           labs(title = title,
+                x = deparse(substitute(x)),
+                y = "PWD_TT") +
+           theme_classic(base_size = 12)
+    ggsave(file.path(out_dir, pair_name,
+                     paste0(file_stub, ".pdf")), p, width = 5, height = 5)
+  }
+
+  dir.create(file.path(out_dir, pair_name), recursive = TRUE,
+             showWarnings = FALSE)
+
+  plot_triangle(mean_TT, pwd_TT,
+                paste0(pair_name, "  β̄TT vs PWD"),
+                "triangle_TT")
+
+  plot_triangle(delta_N, pwd_TT,
+                paste0(pair_name, "  Δβ (tumour – normal) vs PWD"),
+                "triangle_shift")
+
+  p_heat <- ggplot(dt, aes(beta_N, mean_TT)) +
+              stat_bin2d(bins = 120) +
+              scale_fill_viridis_c(trans = "log10") +
+              geom_abline(colour = "grey70") +
+              coord_equal(xlim = c(0,1), ylim = c(0,1)) +
+              labs(title = paste0(pair_name,
+                                  "  mean β (normal) vs mean β (tumour)"),
+                   x = "β  normal", y = "β  tumour") +
+              theme_classic(base_size = 12)
+
+  ggsave(file.path(out_dir, pair_name, "heat_tumour_vs_normal.pdf"),
+         p_heat, width = 5, height = 5)
+}
+```
+
+
+```{r}
+###########################  SUMMARY TABLE  ###############################
+pair_qc <- rbindlist(pair_stats)
+pair_qc[ , `:=`(frac_norm = sprintf("%.2f %%", frac_norm*100),
+                frac_norm_T = sprintf("%.2f %%", frac_norm_T*100))]
+cat("\n\n=====  conserved windows  =====================================\n")
+print(pair_qc, row.names = FALSE)
+cat("================================================================\n")
+
+```
+

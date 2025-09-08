@@ -1,0 +1,262 @@
+---
+title: "Genome_25bp"
+output: html_document
+date: "2025-07-21"
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(dplyr)
+  library(ggplot2)
+})
+
+```
+
+```{r}
+############################################################################
+## USER-EDITABLE PARAMETERS  (one place only) 
+############################################################################
+params <- list(
+  data_dir       = "data",
+  out_dir        = "export",
+  tumor_samples  = c("IA","IB","EA","EB","FA","FB","SA","SB","MA","MB","DA","DB","PA","PB","HA","HB","XA","XB","KA","KB"),
+  normal_samples = c("IN","JN","EN"),
+  chr            = "chr17",  # e.g. "chr5", "chrX"
+  tile_width     = 100L,
+  cov_min        = 5L,
+  cpgs_per_tile  = 1L        # ≥ N CpGs to retain a tile
+)
+
+
+############################################################################
+## HELPERS -----------------------------------------------------------------
+############################################################################
+read_wgbs <- function(id, p){
+  dt <- fread(file.path(p$data_dir, paste0(id, ".bed")),
+              col.names = c("chr","start","end","beta","cov","meth","unmeth"))[
+          cov >= p$cov_min & chr == p$chr]
+  GRanges(seqnames = dt$chr,
+          ranges   = IRanges(dt$start, dt$end),
+          beta     = dt$beta)
+}
+
+make_tiles <- function(chr, w){
+  len <- seqlengths(BSgenome.Hsapiens.UCSC.hg38)[chr]
+  GRanges(chr, IRanges(seq(1, len, by = w), width = w))
+}
+
+summarize_on_tiles <- function(gr, tiles, id){
+  ov <- findOverlaps(tiles, gr)
+  data.table(tile = queryHits(ov),
+             beta = mcols(gr)$beta[subjectHits(ov)]
+  )[, .(n_cpg = .N, mean_beta = mean(beta)), by = tile
+  ][, sample := id]
+}
+
+## -----------------------------------------------------------
+## helper: pairwise distance bedGraph
+## -----------------------------------------------------------
+write_pairwise_bg <- function(sum_dt, tiles_dt, idA, idB, p){
+  tmp <- merge(
+           sum_dt[sample == idA, .(tile, betaA = mean_beta)],
+           sum_dt[sample == idB, .(tile, betaB = mean_beta)],
+           by = "tile"
+         )[, .(tile, pwd = abs(betaA - betaB))]
+
+  bg  <- merge(tmp, tiles_dt, by = "tile")[, .(chr, start, end, pwd)]
+
+  fn  <- file.path(p$out_dir,
+          sprintf("%s_%s_vs_%s_%dbp.pwd.bedGraph",
+                  p$chr, idA, idB, p$tile_width))
+
+  hdr <- sprintf(
+    'track type=bedGraph name="PWD %s–%s (%dbp)" description="|β_%s - β_%s| on %s" visibility=full color=0,0,200',
+    idA, idB, p$tile_width, idA, idB, p$chr)
+
+  writeLines(hdr, fn)
+  fwrite(bg, fn, sep = "\t", col.names = FALSE, quote = FALSE, append = TRUE)
+
+  message("✓ wrote ", fn)
+}
+
+
+
+```
+
+
+```{r}
+############################################################################
+## MAIN PIPELINE -----------------------------------------------------------
+############################################################################
+run_pipeline <- function(p){
+  dir.create(p$out_dir, showWarnings = FALSE)
+
+  tiles   <- make_tiles(p$chr, p$tile_width)
+  tiles_dt<- data.table(chr   = as.character(seqnames(tiles)),
+                        start = start(tiles) - 1,
+                        end   = end(tiles),
+                        tile  = seq_along(tiles))
+
+  samp_all <- c(p$tumor_samples, p$normal_samples)
+  summaries <- rbindlist(lapply(samp_all, \(id){
+                   summarize_on_tiles(read_wgbs(id, p), tiles, id)
+                 }))
+
+  ## average normals
+  good_tiles <- summaries[n_cpg >= p$cpgs_per_tile, unique(tile)]
+  summaries  <- summaries[tile %in% good_tiles]
+  
+## now compute Normal_Avg on that filtered set
+norm_avg <- summaries[sample %in% p$normal_samples,
+                      .(n_cpg     = unique(n_cpg)[1L],    # or min / max / round(mean())
+                        mean_beta = mean(mean_beta)),
+                      by = tile][
+                      , sample := "Normal_Avg"]           # <- add this line
+
+## bind and keep only well-covered tiles
+summ <- rbind(summaries, norm_avg)[n_cpg >= p$cpgs_per_tile]
+
+
+## 1. merge coordinates ----------------------------------------------------
+bg <- merge(summ, tiles_dt, by = "tile", sort = FALSE)[
+        , .(chr, start, end, sample, mean_beta)]
+
+## 2. write one bedGraph per sample (β) ------------------------------------
+for (s in unique(bg$sample)) {
+  fn  <- file.path(p$out_dir,
+                   sprintf("%s_%s_%dbp.beta.bedGraph",
+                           p$chr, s, p$tile_width))
+
+  hdr <- sprintf(
+    'track type=bedGraph name="%s beta (%dbp)" description="Mean methylation beta (%s %s)" visibility=full',
+    s, p$tile_width, s, p$chr)
+
+  writeLines(hdr, fn)
+  fwrite(bg[sample == s, .(chr, start, end, mean_beta)],
+         fn, sep = "\t", col.names = FALSE, quote = FALSE, append = TRUE)
+}
+
+## 3. Δβ (tumour minus Normal_Avg) tracks ----------------------------------
+tumour_ids <- p$tumor_samples
+norm_track <- "Normal_Avg"
+
+for (t in tumour_ids) {
+  delta <- merge(
+             bg[sample == t,          .(chr, start, end, beta_tum  = mean_beta)],
+             bg[sample == norm_track, .(chr, start, end, beta_norm = mean_beta)],
+             by = c("chr","start","end")
+           )[, .(chr, start, end, delta = beta_tum - beta_norm)]
+
+  fn  <- file.path(p$out_dir,
+                   sprintf("%s_%s_minus_normal_%dbp.delta.bedGraph",
+                           p$chr, t, p$tile_width))
+
+  hdr <- sprintf(
+    'track type=bedGraph name="Delta beta %s-Normal (%dbp)" description="Tumour minus Normal_Avg (%s %s)" visibility=full color=255,0,0 altColor=0,150,0',
+    t, p$tile_width, t, p$chr)
+
+  writeLines(hdr, fn)
+  fwrite(delta, fn, sep = "\t", col.names = FALSE, quote = FALSE, append = TRUE)
+}
+
+invisible(list(summary_dt = summ, tiles_dt = tiles_dt))   # add back if removed
+}
+############################################################################
+## RUN ---------------------------------------------------------------------
+############################################################################
+res <- run_pipeline(params)
+```
+
+
+```{r}
+
+## you can loop over multiple pairs:
+pairs_to_make <- list(c("IA","IB"), c("EA","EB"), c("IA","EA"))
+for (pr in pairs_to_make)
+  write_pairwise_bg(res$summary_dt, res$tiles_dt, pr[1], pr[2], params)
+
+# Filter to the five key samples
+samples_to_plot <- c("IA", "IB", "EA", "EB", "Normal_Avg")
+summary_facet <- res$summary_dt[sample %in% samples_to_plot]
+
+ggplot(summary_facet, aes(x = n_cpg)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black", boundary = 0.5) +
+  scale_x_continuous(breaks = seq(0, max(summary_facet$n_cpg), by = 1)) +
+  facet_wrap(~ sample, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Distribution of CpGs per 25bp Tile",
+       x = "# CpGs in Tile (cov ≥ 5)", y = "Tile Count")
+
+
+# 2. Methylation level distribution per tile, faceted by sample
+ggplot(summary_facet, aes(x = mean_beta)) +
+  geom_histogram(bins = 50, fill = "darkorange", color = "black") +
+  facet_wrap(~ sample, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Distribution of Mean Beta (Methylation)",
+       x = "Mean Beta", y = "Tile Count")
+```
+
+
+```{r}
+# 3. Summary table
+summary_tbl <- res$summary_dt[
+  sample %in% plot_samples,
+  .(
+    tiles            = .N,
+    avg_cpg_per_tile = mean(n_cpg),
+    mean_beta        = mean(mean_beta),
+    median_beta      = median(mean_beta),
+    pct_hypo         = mean(mean_beta <= 0.20),
+    pct_hyper        = mean(mean_beta >= 0.80)
+  ),
+  by = sample
+][
+  , sample := factor(sample, levels = plot_samples)
+][
+  order(sample)
+]
+
+print(summary_tbl)
+
+```
+
+```{r}
+
+## After running the pipeline
+res <- run_pipeline(params)
+
+## Merge tile coordinates and compute mid-point
+summary_dt_pos <- merge(res$summary_dt,   # β + n_cpg + sample + tile
+                        res$tiles_dt,     # chr / start / end / tile
+                        by = "tile", sort = FALSE)
+
+summary_dt_pos[, mid := (start + end) / 2]   # midpoint for x-axis
+
+
+## correct pooled-normal label --------------------------------------------
+avg_normal_name <- "Normal_Avg"   # <-- must match the 'sample' column value
+
+tumor_samples  <- c("IA", "IB", "EA", "EB")
+normal_samples <- c("IN", "JN", "EN")
+plot_samples   <- c(tumor_samples, normal_samples, avg_normal_name)
+
+## 1. Individual methylation profiles --------------------------------------
+for (s in plot_samples) {
+  print(
+    ggplot(summary_dt_pos[sample == s],
+           aes(x = mid, y = mean_beta)) +
+      geom_point(alpha = 0.20, size = 0.40) +
+      geom_smooth(method = "gam", colour = "red") +
+      theme_minimal() +
+      labs(title = sprintf("%s: chr17 methylation", s),
+           x = "Genomic position (bp)", y = "Mean β")
+  )
+}
+```
+

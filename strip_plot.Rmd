@@ -1,0 +1,207 @@
+---
+title: "strip_plot"
+output: html_document
+date: "2025-08-07"
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  library(AnnotationDbi)
+  suppressWarnings(suppressMessages(require(org.Hs.eg.db)))
+  library(ggplot2)
+})
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GenomicRanges)
+  library(GenomeInfoDb)
+  library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  library(AnnotationDbi)
+  library(ggplot2)
+})
+
+```
+
+```{r}
+
+
+## ------------------------------------------------------------
+## 0) Inputs from your pipeline
+## ------------------------------------------------------------
+stopifnot(exists("res"), exists("params"))
+summary_dt <- res$summary_dt        # tile x sample with mean_beta
+tiles_dt   <- res$tiles_dt          # chr, start(0-based), end, tile
+
+## tiles as GRanges (convert start to 1-based)
+tiles_gr <- GRanges(seqnames = tiles_dt$chr,
+                    ranges   = IRanges(tiles_dt$start + 1L, tiles_dt$end))
+
+## ------------------------------------------------------------
+## 1) Make promoter-by-gene and CDS-by-gene regions on chr17
+##    (avoid the GENEID IntegerList by aggregating per gene)
+## ------------------------------------------------------------
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+## promoters: build per-gene by taking union of all transcript promoters
+tx_by_gene   <- transcriptsBy(txdb, by = "gene")
+prom_by_gene <- promoters(tx_by_gene, upstream = 2000, downstream = 200)      # GRangesList by gene
+prom_by_gene <- endoapply(prom_by_gene, reduce)                               # union within gene
+
+## CDS per gene (union)
+cds_by_gene <- cdsBy(txdb, by = "gene")
+cds_by_gene <- endoapply(cds_by_gene, reduce)
+
+## keep only chr17
+keep_chr <- function(grl, chr){
+  endoapply(grl, \(g) keepSeqlevels(g, chr, pruning.mode = "coarse"))
+}
+prom_by_gene <- keep_chr(prom_by_gene, params$chr)
+cds_by_gene  <- keep_chr(cds_by_gene,  params$chr)
+
+## flatten and retain the gene ID for each range
+flatten_gene_gr <- function(grl){
+  gr  <- unlist(grl, use.names = FALSE)
+  gid <- rep(names(grl), elementNROWS(grl))
+  mcols(gr)$GENEID <- gid
+  gr
+}
+prom_gene_gr <- flatten_gene_gr(prom_by_gene)
+cds_gene_gr  <- flatten_gene_gr(cds_by_gene)
+
+## helper: overlaps -> data.table(tile, GENEID)
+ov_tbl <- function(region_gr){
+  ov <- findOverlaps(region_gr, tiles_gr)
+  data.table(GENEID = mcols(region_gr)$GENEID[queryHits(ov)],
+             tile   = subjectHits(ov))
+}
+prom_ov <- ov_tbl(prom_gene_gr)
+cds_ov  <- ov_tbl(cds_gene_gr)
+
+## Optional gene symbols
+get_symbol <- function(ids){
+  if (requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+    as.character(AnnotationDbi::mapIds(org.Hs.eg.db, keys = ids,
+                                       column = "SYMBOL", keytype = "ENTREZID",
+                                       multiVals = "first"))
+  } else rep(NA_character_, length(ids))
+}
+
+## ------------------------------------------------------------
+## 2) NORMAL conservation (mean PWD across 3 normal pairs)
+## ------------------------------------------------------------
+normal_pairs <- list(c("IN","JN"), c("IN","EN"), c("JN","EN"))
+
+pwd_norm_tile <- rbindlist(lapply(normal_pairs, \(pr){
+  merge(summary_dt[sample == pr[1], .(tile, b1 = mean_beta)],
+        summary_dt[sample == pr[2], .(tile, b2 = mean_beta)],
+        by = "tile")[ , .(tile, pwd = abs(b1 - b2))]
+}))
+pwd_norm_tile <- pwd_norm_tile[ , .(norm_pwd = mean(pwd, na.rm = TRUE)), by = tile]
+
+## region-level (gene-level) conservation: average across tiles per gene
+conserve_by_gene <- function(ov_dt){
+  merge(ov_dt, pwd_norm_tile, by = "tile")[
+    , .(norm_pwd = mean(norm_pwd, na.rm = TRUE),
+        ntiles   = .N),
+    by = GENEID][!is.na(norm_pwd)]
+}
+prom_cons <- conserve_by_gene(prom_ov)
+cds_cons  <- conserve_by_gene(cds_ov)
+
+## pick top N genes with lowest normal PWD (most conserved)
+pick_top_genes <- function(cons_dt, topN = 5){
+  cons_dt[order(norm_pwd, -ntiles)][1:min(topN, .N)]
+}
+top5_prom <- pick_top_genes(prom_cons, 5)
+top5_cds  <- pick_top_genes(cds_cons,  5)
+
+## labels ordered by conservation (use symbol if available)
+mk_labels <- function(top_dt, prefix){
+  sym <- get_symbol(top_dt$GENEID)
+  lab <- ifelse(is.na(sym) | sym == "", paste0(prefix, top_dt$GENEID),
+                                        paste0(prefix, sym))
+  factor(lab, levels = lab[order(top_dt$norm_pwd)])
+}
+prom_lab <- mk_labels(top5_prom, "prom:")
+cds_lab  <- mk_labels(top5_cds,  "cds:")
+
+## ------------------------------------------------------------
+## 3) Region-level mean β per tumour sample
+## ------------------------------------------------------------
+region_beta_by_sample <- function(ov_dt){
+  merge(ov_dt, summary_dt[, .(tile, sample, mean_beta)], by = "tile")[
+    , .(mean_beta = mean(mean_beta, na.rm = TRUE)), by = .(GENEID, sample)]
+}
+prom_beta <- region_beta_by_sample(prom_ov)
+cds_beta  <- region_beta_by_sample(cds_ov)
+
+## keep only top genes & tumour samples
+pairE <- c("EA","EB")
+pairI <- c("IA","IB")
+
+prom_beta_E <- prom_beta[GENEID %in% top5_prom$GENEID & sample %in% pairE]
+prom_beta_I <- prom_beta[GENEID %in% top5_prom$GENEID & sample %in% pairI]
+cds_beta_E  <- cds_beta [GENEID %in% top5_cds$GENEID  & sample %in% pairE]
+cds_beta_I  <- cds_beta [GENEID %in% top5_cds$GENEID  & sample %in% pairI]
+
+## attach ordered labels
+add_region_label <- function(dt, top_dt, fac){
+  gid2lab <- setNames(as.character(fac), top_dt$GENEID)
+  dt[ , region_lab := factor(gid2lab[GENEID], levels = levels(fac))]
+  dt
+}
+prom_beta_E <- add_region_label(prom_beta_E, top5_prom, prom_lab)
+prom_beta_I <- add_region_label(prom_beta_I, top5_prom, prom_lab)
+cds_beta_E  <- add_region_label(cds_beta_E,  top5_cds,  cds_lab)
+cds_beta_I  <- add_region_label(cds_beta_I,  top5_cds,  cds_lab)
+
+## line ranges (the tumour-pair PWD at the gene level)
+mk_linerange <- function(dt_pair){
+  dt_pair[ , .(ymin = min(mean_beta, na.rm = TRUE),
+               ymax = max(mean_beta, na.rm = TRUE)),
+           by = region_lab]
+}
+lr_prom_E <- mk_linerange(prom_beta_E)
+lr_prom_I <- mk_linerange(prom_beta_I)
+lr_cds_E  <- mk_linerange(cds_beta_E)
+lr_cds_I  <- mk_linerange(cds_beta_I)
+
+## ------------------------------------------------------------
+## 4) Plot helper and draw the four panels
+## ------------------------------------------------------------
+plot_pair <- function(df_points, df_lines, title_txt){
+  ggplot() +
+    geom_linerange(data = df_lines,
+                   aes(x = region_lab, ymin = ymin, ymax = ymax),
+                   colour = "grey60", linewidth = 1) +
+    geom_point(data = df_points,
+               aes(x = region_lab, y = mean_beta, colour = sample),
+               position = position_dodge(width = 0.35), size = 2.3) +
+    scale_colour_manual(values = c("EA"="#1b9e77","EB"="#d95f02",
+                                   "IA"="#7570b3","IB"="#e7298a")) +
+    theme_minimal(base_size = 12) +
+    theme(axis.title.x = element_blank(),
+          axis.text.x  = element_text(angle = 45, hjust = 1),
+          legend.position = "top") +
+    labs(title = title_txt, y = "Mean β across 25-bp tiles in region")
+}
+
+p_prom_E <- plot_pair(prom_beta_E, lr_prom_E,
+  sprintf("Promoters — Pair E (EA vs EB) — top 5 most conserved by normals on %s", params$chr))
+p_cds_E  <- plot_pair(cds_beta_E,  lr_cds_E,
+  sprintf("CDS — Pair E (EA vs EB) — top 5 most conserved by normals on %s", params$chr))
+p_prom_I <- plot_pair(prom_beta_I, lr_prom_I,
+  sprintf("Promoters — Pair I (IA vs IB) — top 5 most conserved by normals on %s", params$chr))
+p_cds_I  <- plot_pair(cds_beta_I,  lr_cds_I,
+  sprintf("CDS — Pair I (IA vs IB) — top 5 most conserved by normals on %s", params$chr))
+
+print(p_prom_E); print(p_cds_E); print(p_prom_I); print(p_cds_I)
+
+```
+
+
+
